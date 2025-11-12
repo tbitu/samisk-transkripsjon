@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Samisk Transkribering</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="app-header">
+      <div>
+        <h1>Samisk transkribering</h1>
+        <p>Upload audio or video in one step, then review and download the transcript.</p>
+      </div>
+    </header>
+
+    <div class="layout">
+      <section class="panel panel-upload">
+        <div class="panel-body">
+          <form id="upload-form" class="upload-form" aria-label="Upload media for transcription">
+            <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-describedby="dropzone-help">
+              <div class="dropzone-icon" aria-hidden="true">
+                <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 17.5V6.5A2.5 2.5 0 0 1 5.5 4h13a2.5 2.5 0 0 1 2.5 2.5v11a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5Z"/>
+                  <path d="M12 12v6"/>
+                  <path d="M9 15l3-3 3 3"/>
+                  <path d="M6 8h12"/>
+                </svg>
+              </div>
+              <p class="dropzone-title">Drag &amp; drop your file</p>
+              <p id="dropzone-help" class="dropzone-help">Audio or video up to 2 GB. You can also <span class="dropzone-browse">browse</span> your device.</p>
+            </div>
+            <input type="file" id="file-input" class="sr-only" accept="audio/*,video/*" required>
+
+            <div id="file-summary" class="file-summary hidden" aria-live="polite"></div>
+
+            <div id="progress-wrapper" class="progress-wrapper hidden" aria-live="polite">
+              <div class="progress-block">
+                <div class="progress-label">
+                  <span id="current-progress-label">Current task</span>
+                  <span id="current-progress-value">0%</span>
+                </div>
+                <div id="current-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Current task progress">
+                  <div id="current-progress-fill" class="progress-bar__fill"></div>
+                  <span id="current-progress-text" class="progress-bar__text">0%</span>
+                </div>
+              </div>
+              <div class="progress-block">
+                <div class="progress-label">
+                  <span id="overall-progress-label">Overall progress</span>
+                  <span id="overall-progress-value">0%</span>
+                </div>
+                <div id="overall-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Overall transcription progress">
+                  <div id="overall-progress-fill" class="progress-bar__fill"></div>
+                  <span id="overall-progress-text" class="progress-bar__text">0%</span>
+                </div>
+              </div>
+            </div>
+
+            <button type="submit" id="submit-btn" class="button-primary">Start transcription</button>
+            <button type="button" id="new-upload-btn" class="button-secondary hidden">Upload another file</button>
+          </form>
+          <div id="status" class="status" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section id="output-panel" class="panel panel-output hidden" aria-live="polite">
+        <div class="panel-body">
+          <div class="output-header">
+            <div>
+              <h2>Transcript</h2>
+              <div id="job-status" class="job-status"></div>
+            </div>
+            <div class="action-buttons">
+              <button id="save-btn" class="button-primary" disabled>Save corrections</button>
+              <button id="download-btn" class="button-secondary" disabled>Download PDF</button>
+            </div>
+          </div>
+          <div class="editor-wrapper">
+            <label class="sr-only" for="transcript-text">Transcript editor</label>
+            <textarea id="transcript-text" placeholder="Your transcript will appear here when processing completes." disabled></textarea>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const form = document.getElementById('upload-form');
+    const fileInput = document.getElementById('file-input');
+    const dropzone = document.getElementById('dropzone');
+    const fileSummary = document.getElementById('file-summary');
+    const statusEl = document.getElementById('status');
+    const outputPanel = document.getElementById('output-panel');
+    const jobStatusEl = document.getElementById('job-status');
+    const transcriptText = document.getElementById('transcript-text');
+    const saveBtn = document.getElementById('save-btn');
+    const downloadBtn = document.getElementById('download-btn');
+    const submitBtn = document.getElementById('submit-btn');
+    const progressWrapper = document.getElementById('progress-wrapper');
+    const currentProgressBar = document.getElementById('current-progress-bar');
+    const currentProgressFill = document.getElementById('current-progress-fill');
+    const currentProgressText = document.getElementById('current-progress-text');
+    const currentProgressLabel = document.getElementById('current-progress-label');
+    const currentProgressValue = document.getElementById('current-progress-value');
+    const overallProgressBar = document.getElementById('overall-progress-bar');
+    const overallProgressFill = document.getElementById('overall-progress-fill');
+    const overallProgressText = document.getElementById('overall-progress-text');
+    const overallProgressValue = document.getElementById('overall-progress-value');
+    const newUploadBtn = document.getElementById('new-upload-btn');
+
+    let currentJobId = null;
+    let pollTimer = null;
+    let selectedFile = null;
+  let processingAnimationTimer = null;
+  let currentPhase = null;
+    let currentTaskPercent = 0;
+    let overallPercent = 0;
+
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0 B';
+      if (!bytes) return '';
+      const units = ['B', 'KB', 'MB', 'GB'];
+      const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+      const value = bytes / Math.pow(1024, exponent);
+      return `${value.toFixed(value >= 10 || exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+    }
+
+    function setStatus(message, type = '') {
+      statusEl.textContent = message;
+      statusEl.className = `status${type ? ` status--${type}` : ''}`;
+    }
+
+    function resetOutput() {
+      outputPanel.classList.add('hidden');
+      jobStatusEl.textContent = '';
+      transcriptText.value = '';
+      transcriptText.disabled = true;
+      saveBtn.disabled = true;
+      downloadBtn.disabled = true;
+      currentJobId = null;
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    function showDropzone() {
+      dropzone.classList.remove('hidden');
+      dropzone.setAttribute('aria-hidden', 'false');
+    }
+
+    function hideDropzone() {
+      dropzone.classList.add('hidden');
+      dropzone.setAttribute('aria-hidden', 'true');
+    }
+
+    function stopProcessingAnimation() {
+      if (processingAnimationTimer) {
+        clearInterval(processingAnimationTimer);
+        processingAnimationTimer = null;
+      }
+    }
+
+    function setProgress({
+      currentLabel,
+      currentValue,
+      overallValue,
+    }) {
+      if (typeof currentLabel === 'string') {
+        currentProgressLabel.textContent = currentLabel;
+      }
+
+      if (typeof currentValue === 'number') {
+        currentTaskPercent = Math.max(0, Math.min(100, currentValue));
+        currentProgressBar.setAttribute('aria-valuenow', String(Math.round(currentTaskPercent)));
+        currentProgressFill.style.width = `${currentTaskPercent}%`;
+        const currentDisplay = `${Math.round(currentTaskPercent)}%`;
+        currentProgressText.textContent = currentDisplay;
+        currentProgressValue.textContent = currentDisplay;
+      }
+
+      if (typeof overallValue === 'number') {
+        overallPercent = Math.max(0, Math.min(100, overallValue));
+        overallProgressBar.setAttribute('aria-valuenow', String(Math.round(overallPercent)));
+        overallProgressFill.style.width = `${overallPercent}%`;
+        const overallDisplay = `${Math.round(overallPercent)}%`;
+        overallProgressText.textContent = overallDisplay;
+        overallProgressValue.textContent = overallDisplay;
+      }
+    }
+
+    function startProcessingAnimation() {
+      stopProcessingAnimation();
+      processingAnimationTimer = setInterval(() => {
+        if (currentPhase !== 'processing') {
+          stopProcessingAnimation();
+          return;
+        }
+        const nextTask = Math.min(95, currentTaskPercent + Math.random() * 5);
+        const nextOverall = Math.min(95, overallPercent + Math.random() * 3);
+        setProgress({ currentValue: nextTask, overallValue: nextOverall });
+      }, 1800);
+    }
+
+    function setSubmitButton(label, disabled) {
+      submitBtn.textContent = label;
+      submitBtn.disabled = disabled;
+    }
+
+    function setPhase(phase) {
+      if (phase === currentPhase) {
+        return;
+      }
+
+      currentPhase = phase;
+
+      switch (phase) {
+        case 'idle':
+          stopProcessingAnimation();
+          setProgress({ currentLabel: 'Current task', currentValue: 0, overallValue: 0 });
+          progressWrapper.classList.add('hidden');
+          showDropzone();
+          setSubmitButton('Start transcription', false);
+          newUploadBtn.classList.add('hidden');
+          break;
+        case 'uploading':
+          hideDropzone();
+          progressWrapper.classList.remove('hidden');
+          setProgress({ currentLabel: 'Uploading file', currentValue: 15, overallValue: 15 });
+          setSubmitButton('Uploading…', true);
+          newUploadBtn.classList.add('hidden');
+          stopProcessingAnimation();
+          break;
+        case 'queued':
+          hideDropzone();
+          progressWrapper.classList.remove('hidden');
+          setProgress({ currentLabel: 'Queued for transcription', currentValue: 35, overallValue: 35 });
+          setSubmitButton('Processing…', true);
+          newUploadBtn.classList.add('hidden');
+          stopProcessingAnimation();
+          break;
+        case 'processing':
+          hideDropzone();
+          progressWrapper.classList.remove('hidden');
+          setProgress({ currentLabel: 'Transcribing audio', currentValue: 40, overallValue: 60 });
+          setSubmitButton('Processing…', true);
+          newUploadBtn.classList.add('hidden');
+          startProcessingAnimation();
+          break;
+        case 'completed':
+          hideDropzone();
+          progressWrapper.classList.remove('hidden');
+          stopProcessingAnimation();
+          setProgress({ currentLabel: 'Transcription complete', currentValue: 100, overallValue: 100 });
+          setSubmitButton('Transcription complete', true);
+          newUploadBtn.classList.remove('hidden');
+          break;
+        case 'failed':
+          showDropzone();
+          progressWrapper.classList.remove('hidden');
+          stopProcessingAnimation();
+          setProgress({ currentLabel: 'Processing failed', currentValue: 0, overallValue: 0 });
+          setSubmitButton('Start transcription', false);
+          newUploadBtn.classList.remove('hidden');
+          break;
+        default:
+          break;
+      }
+    }
+
+    setPhase('idle');
+
+    function updateSelectedFile(file) {
+      selectedFile = file || null;
+      if (!file) {
+        fileSummary.textContent = '';
+        fileSummary.classList.add('hidden');
+        setPhase('idle');
+        return;
+      }
+
+      fileSummary.innerHTML = '';
+      const nameEl = document.createElement('strong');
+      nameEl.textContent = file.name;
+      const metaEl = document.createElement('span');
+      const fileType = file.type || 'Unknown type';
+      metaEl.textContent = `${fileType} · ${formatBytes(file.size)}`;
+      fileSummary.appendChild(nameEl);
+      fileSummary.appendChild(metaEl);
+      fileSummary.classList.remove('hidden');
+      setStatus('Ready to upload.', 'info');
+    }
+
+    function activateDropzone() {
+      dropzone.classList.add('dropzone--active');
+    }
+
+    function deactivateDropzone() {
+      dropzone.classList.remove('dropzone--active');
+    }
+
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        fileInput.click();
+      }
+    });
+
+    ['dragenter', 'dragover'].forEach((eventName) => {
+      dropzone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        activateDropzone();
+        event.dataTransfer.dropEffect = 'copy';
+      });
+    });
+
+    ['dragleave', 'dragend'].forEach((eventName) => {
+      dropzone.addEventListener(eventName, () => {
+        deactivateDropzone();
+      });
+    });
+
+    dropzone.addEventListener('drop', (event) => {
+      event.preventDefault();
+      deactivateDropzone();
+      const file = event.dataTransfer?.files?.[0];
+      if (!file) {
+        return;
+      }
+      const allowed = file.type.startsWith('audio/') || file.type.startsWith('video/');
+      if (!allowed) {
+        setStatus('Unsupported file type. Please choose audio or video.', 'error');
+        return;
+      }
+      try {
+        const dataTransfer = new DataTransfer();
+        dataTransfer.items.add(file);
+        fileInput.files = dataTransfer.files;
+      } catch (assignError) {
+        // Fallback for browsers without DataTransfer constructor support.
+      }
+      updateSelectedFile(file);
+      resetOutput();
+    });
+
+    fileInput.addEventListener('change', (event) => {
+      const file = event.target.files?.[0];
+      updateSelectedFile(file || null);
+      resetOutput();
+    });
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const file = fileInput.files?.[0] || selectedFile;
+      if (!file) {
+        setStatus('Please choose a file first.', 'error');
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('file', file);
+      setStatus('Uploading file…', 'info');
+      resetOutput();
+      setPhase('uploading');
+
+      try {
+        const response = await fetch('/api/transcriptions', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!response.ok) {
+          let errorMessage = 'Upload failed';
+          try {
+            const error = await response.json();
+            errorMessage = error.detail || errorMessage;
+          } catch (parseError) {
+            // Ignore JSON parse errors; fall back to default message.
+          }
+          throw new Error(errorMessage);
+        }
+
+        const data = await response.json();
+        currentJobId = data.job_id;
+        outputPanel.classList.remove('hidden');
+        jobStatusEl.textContent = 'Processing…';
+        transcriptText.value = '';
+        transcriptText.disabled = true;
+        setStatus('File uploaded. Transcription started.', 'success');
+        setPhase(data.status || 'queued');
+        startPolling();
+      } catch (error) {
+        console.error(error);
+        setStatus(error.message || 'Upload failed', 'error');
+        setPhase('failed');
+      }
+    });
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(async () => {
+        if (!currentJobId) return;
+        try {
+          const response = await fetch(`/api/transcriptions/${currentJobId}`);
+          if (!response.ok) {
+            throw new Error('Failed to retrieve job status');
+          }
+          const data = await response.json();
+          jobStatusEl.textContent = data.status;
+          setPhase(data.status);
+
+          if (data.status === 'completed') {
+            clearInterval(pollTimer);
+            pollTimer = null;
+            transcriptText.value = data.text || '';
+            transcriptText.disabled = false;
+            transcriptText.focus({ preventScroll: true });
+            saveBtn.disabled = false;
+            downloadBtn.disabled = false;
+            setStatus('Transcription complete. Review and correct as needed.', 'success');
+            setPhase('completed');
+          } else if (data.status === 'failed') {
+            clearInterval(pollTimer);
+            pollTimer = null;
+            transcriptText.disabled = true;
+            setStatus(`Transcription failed: ${data.error || 'Unknown error'}`, 'error');
+            setPhase('failed');
+          }
+        } catch (error) {
+          console.error(error);
+        }
+      }, 3000);
+    }
+
+    saveBtn.addEventListener('click', async () => {
+      if (!currentJobId) return;
+      saveBtn.disabled = true;
+      setStatus('Saving corrections…', 'info');
+      try {
+        const response = await fetch(`/api/transcriptions/${currentJobId}/finalise`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: transcriptText.value }),
+        });
+        if (!response.ok) {
+          let errorMessage = 'Failed to save corrections';
+          try {
+            const error = await response.json();
+            errorMessage = error.detail || errorMessage;
+          } catch (parseError) {
+            // Ignore JSON parse errors; fall back to default message.
+          }
+          throw new Error(errorMessage);
+        }
+        setStatus('Corrections saved.', 'success');
+        downloadBtn.disabled = false;
+      } catch (error) {
+        console.error(error);
+        setStatus(error.message || 'Failed to save corrections', 'error');
+      } finally {
+        saveBtn.disabled = false;
+      }
+    });
+
+    downloadBtn.addEventListener('click', () => {
+      if (!currentJobId) return;
+      window.open(`/api/transcriptions/${currentJobId}/download`, '_blank');
+    });
+
+    newUploadBtn.addEventListener('click', () => {
+      fileInput.value = '';
+      selectedFile = null;
+      fileSummary.textContent = '';
+      fileSummary.classList.add('hidden');
+      setStatus('', '');
+      setPhase('idle');
+      currentJobId = null;
+      stopProcessingAnimation();
+    });
+  </script>
+</body>
+</html>

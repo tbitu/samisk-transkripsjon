@@ -1,0 +1,29 @@
+# Core runtime
+fastapi>=0.110
+uvicorn[standard]>=0.30
+pydantic>=2.7
+python-multipart>=0.0.9
+transformers>=4.39
+accelerate>=0.30
+ffmpeg-python>=0.2
+numpy>=1.24
+soundfile>=0.12
+pyannote.audio>=3.1
+librosa>=0.10
+fpdf2>=2.7
+
+# PyTorch and torchaudio are installed separately because CUDA builds
+# are platform/driver-specific. Use one of the commands below depending
+# on whether you want a CUDA-capable build or a CPU-only build.
+#
+# For CUDA 12.9 (recommended if your driver supports it):
+# python -m pip install --index-url https://download.pytorch.org/whl/cu129 \
+#   --extra-index-url https://download.pytorch.org/whl/torch_stable.html \
+#   torch torchaudio --upgrade
+#
+# For CPU-only (if you don't want GPU support):
+# python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Development/test deps
+pytest>=7.4
+httpx>=0.27
