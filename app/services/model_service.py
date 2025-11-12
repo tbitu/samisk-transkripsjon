@@ -50,6 +50,17 @@ def get_asr_pipeline() -> Any:
 
     if isinstance(device, int):
         model = model.to(device)
+        try:
+            torch.set_float32_matmul_precision("high")
+        except AttributeError:
+            pass
+        try:
+            if torch.backends.cuda.matmul is not None:
+                torch.backends.cuda.matmul.allow_tf32 = True
+            if torch.backends.cudnn is not None:
+                torch.backends.cudnn.allow_tf32 = True
+        except AttributeError:
+            pass
 
     processor = AutoProcessor.from_pretrained(MODEL_ID)
 

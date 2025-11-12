@@ -7,10 +7,14 @@ import logging
 import math
 import os
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional
+from tempfile import TemporaryDirectory
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import ffmpeg
 import numpy as np
@@ -54,12 +58,17 @@ def prepare_sentence_chunks(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if progress:
-        progress(0.0, {"stage": "start"})
+    progress_adapter = _ProgressAdapter(progress) if progress else None
+
+    if progress_adapter:
+        progress_adapter.emit_start()
 
     # Diarization is mandatory: always attempt diarization and fail loudly
     try:
-        diarization = _run_diarization(source, progress=progress)
+        diarization = _run_diarization(
+            source,
+            progress=progress_adapter.emit_diarization if progress_adapter else None,
+        )
     except Exception as exc:  # pragma: no cover - external failures should surface
         logger.error("Speaker diarization failed: %s", exc)
         raise
@@ -70,31 +79,144 @@ def prepare_sentence_chunks(
         logger.error("Diarization completed but produced no chunks for %s", source)
         raise RuntimeError("Diarization produced no chunks")
 
-    chunks: List[SentenceChunk] = []
+    chunks: List[Optional[SentenceChunk]] = [None] * len(segments_to_extract)
     total = len(segments_to_extract)
 
-    for index, (start_ms, end_ms, speaker) in enumerate(segments_to_extract):
-        target_path = output_dir / f"sentence_{index:04d}.wav"
-        _extract_segment(source, start_ms, end_ms, target_path)
-        is_question = _estimate_question(target_path)
+    if total == 0:
+        return []
 
-        chunks.append(
-            SentenceChunk(
-                path=target_path,
-                start_ms=start_ms,
-                end_ms=end_ms,
-                speaker=speaker,
-                is_question=is_question,
+    worker_count = _suggest_sentence_workers(total)
+
+    if progress_adapter:
+        progress_adapter.emit_chunking_reset(total)
+
+    if worker_count <= 1:
+        for index, (start_ms, end_ms, speaker) in enumerate(segments_to_extract):
+            chunk_index, chunk = _build_sentence_chunk(
+                source,
+                output_dir,
+                index,
+                start_ms,
+                end_ms,
+                speaker,
             )
+            chunks[chunk_index] = chunk
+            if progress_adapter:
+                progress_adapter.emit_chunking_progress(index + 1)
+    else:
+        completed = 0
+        counter_lock = threading.Lock()
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    _build_sentence_chunk,
+                    source,
+                    output_dir,
+                    index,
+                    start_ms,
+                    end_ms,
+                    speaker,
+                )
+                for index, (start_ms, end_ms, speaker) in enumerate(segments_to_extract)
+            ]
+
+            for future in as_completed(futures):
+                chunk_index, chunk = future.result()
+                chunks[chunk_index] = chunk
+
+                if progress_adapter:
+                    with counter_lock:
+                        completed += 1
+                        progress_adapter.emit_chunking_progress(completed)
+
+    prepared_chunks = [chunk for chunk in chunks if chunk is not None]
+    _offload_diarization_pipeline()
+    return prepared_chunks
+
+
+class _ProgressAdapter:
+    """Normalize diarization + chunking progress into a single monotonic track."""
+
+    _DIARIZATION_WEIGHT = 0.7
+    _CHUNKING_WEIGHT = 1.0 - _DIARIZATION_WEIGHT
+
+    def __init__(
+        self,
+        callback: Callable[[float, Optional[Dict[str, object]]], None],
+    ) -> None:
+        self._callback = callback
+        self._lock = threading.Lock()
+        self._diarization_fraction = 0.0
+        self._chunking_fraction = 0.0
+        self._total_chunks = 0
+        self._last_combined = 0.0
+
+    def emit_start(self) -> None:
+        self._safe_emit(0.0, {"phase": "diarization", "stage": "start"})
+
+    def emit_diarization(
+        self,
+        fraction: float,
+        meta: Optional[Dict[str, object]] = None,
+    ) -> None:
+        bounded = self._bound(fraction)
+        with self._lock:
+            self._diarization_fraction = max(self._diarization_fraction, bounded)
+            combined = self._combined_progress()
+        payload = dict(meta or {})
+        payload.setdefault("phase", "pyannote")
+        self._safe_emit(combined, payload)
+
+    def emit_chunking_reset(self, total_chunks: int) -> None:
+        with self._lock:
+            self._total_chunks = max(0, total_chunks)
+            self._chunking_fraction = 0.0
+
+    def emit_chunking_progress(self, completed: int) -> None:
+        with self._lock:
+            if self._total_chunks <= 0:
+                fraction = 1.0
+            else:
+                fraction = self._bound(completed / self._total_chunks)
+            self._chunking_fraction = max(self._chunking_fraction, fraction)
+            combined = self._combined_progress()
+        payload: Dict[str, object] = {
+            "phase": "chunking",
+            "completed": completed,
+            "total": self._total_chunks,
+        }
+        self._safe_emit(combined, payload)
+
+    def _combined_progress(self) -> float:
+        combined = (
+            self._diarization_fraction * self._DIARIZATION_WEIGHT
+            + self._chunking_fraction * self._CHUNKING_WEIGHT
         )
+        if combined < self._last_combined:
+            combined = self._last_combined
+        self._last_combined = min(1.0, combined)
+        return self._last_combined
 
-        if progress:
-            progress(
-                (index + 1) / total,
-                {"completed": index + 1, "total": total},
-            )
+    def _safe_emit(
+        self,
+        fraction: float,
+        meta: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if not self._callback:
+            return
+        bounded = self._bound(fraction)
+        payload = meta or {}
+        try:
+            self._callback(bounded, payload)
+        except Exception:  # pragma: no cover - defensive best effort
+            logger.debug("Progress callback failed", exc_info=True)
 
-    return chunks
+    @staticmethod
+    def _bound(value: float) -> float:
+        if not isinstance(value, (float, int)):
+            return 0.0
+        return max(0.0, min(1.0, float(value)))
 
 
 def _has_hf_token() -> bool:
@@ -112,43 +234,45 @@ def _has_hf_token() -> bool:
 
 def _run_diarization(source: Path, progress: Optional[Callable[[float, Optional[Dict[str, object]]], None]] = None):
     pipeline = _load_diarization_pipeline()
+    _ensure_diarization_device(pipeline)
 
-    if not progress:
-        return pipeline(str(source))
+    with _prepare_diarization_source(source) as normalized_source:
+        if not progress:
+            return pipeline(str(normalized_source))
 
-    class _HookAdapter:
-        def __enter__(self):
-            return self
+        class _HookAdapter:
+            def __enter__(self):
+                return self
 
-        def __exit__(self, *args):
-            return False
+            def __exit__(self, *args):
+                return False
 
-        def __call__(
-            self,
-            step_name: str,
-            step_artifact,
-            file: Optional[Mapping] = None,
-            total: Optional[int] = None,
-            completed: Optional[int] = None,
-        ) -> None:
-            try:
-                if total and completed is not None and total > 0:
-                    fraction = float(completed) / float(total)
-                elif completed is not None:
-                    fraction = 1.0 if completed > 0 else 0.0
-                else:
-                    fraction = 0.0
+            def __call__(
+                self,
+                step_name: str,
+                step_artifact,
+                file: Optional[Mapping] = None,
+                total: Optional[int] = None,
+                completed: Optional[int] = None,
+            ) -> None:
+                try:
+                    if total and completed is not None and total > 0:
+                        fraction = float(completed) / float(total)
+                    elif completed is not None:
+                        fraction = 1.0 if completed > 0 else 0.0
+                    else:
+                        fraction = 0.0
 
-                meta: Dict[str, object] = {
-                    "stage": step_name,
-                    "completed": completed,
-                    "total": total,
-                }
-                progress(fraction, meta)
-            except Exception:
-                logger.debug("Hook adapter failed to emit progress", exc_info=True)
+                    meta: Dict[str, object] = {
+                        "stage": step_name,
+                        "completed": completed,
+                        "total": total,
+                    }
+                    progress(fraction, meta)
+                except Exception:
+                    logger.debug("Hook adapter failed to emit progress", exc_info=True)
 
-    return pipeline(str(source), hook=_HookAdapter())
+        return pipeline(str(normalized_source), hook=_HookAdapter())
 
 
 def _iter_diarization_turns(diarization) -> Iterable[tuple[float, float, str]]:
@@ -251,7 +375,131 @@ def _load_diarization_pipeline():  # pragma: no cover - external model loading
     pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL_ID)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pipeline.to(device)
+    _configure_diarization_inference(pipeline)
     return pipeline
+
+
+@contextmanager
+def _prepare_diarization_source(source: Path) -> Iterable[Path]:
+    """Yield a path to 16 kHz mono PCM audio suitable for pyannote."""
+
+    try:
+        info = sf.info(str(source))
+    except Exception:
+        info = None
+
+    if (
+        info
+        and info.samplerate == TARGET_SAMPLE_RATE
+        and getattr(info, "channels", 0) == 1
+    ):
+        # Already in the desired shape.
+        yield source
+        return
+
+    tmpdir = TemporaryDirectory(prefix="pyannote_norm_")
+    try:
+        target = Path(tmpdir.name) / "normalized.wav"
+        process = (
+            ffmpeg.input(str(source))
+            .output(
+                str(target),
+                format="wav",
+                ac=1,
+                ar=TARGET_SAMPLE_RATE,
+                sample_fmt="s16",
+            )
+            .overwrite_output()
+            .global_args("-loglevel", "error")
+        )
+
+        try:
+            process.run(capture_stdout=True, capture_stderr=True)
+        except ffmpeg.Error as exc:
+            stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else str(exc)
+            raise RuntimeError(f"Failed to normalise audio for diarization: {stderr}") from exc
+
+        yield target
+    finally:
+        tmpdir.cleanup()
+
+
+def _configure_diarization_inference(pipeline) -> None:
+    """Increase inference parallelism and batch duration when possible."""
+
+    target_workers = max(1, (os.cpu_count() or 1) // 2)
+    target_batch_size = 32
+    target_duration = 15.0
+
+    def _tune(obj) -> None:
+        if obj is None:
+            return
+        try:
+            if hasattr(obj, "num_workers"):
+                current = getattr(obj, "num_workers", 0) or 0
+                if current < target_workers:
+                    obj.num_workers = target_workers
+            if hasattr(obj, "batch_size"):
+                current = getattr(obj, "batch_size", None)
+                if current is None or current < target_batch_size:
+                    obj.batch_size = target_batch_size
+            if hasattr(obj, "duration"):
+                current = getattr(obj, "duration", None)
+                if current is None or current < target_duration:
+                    obj.duration = target_duration
+        except Exception:
+            logger.debug("Failed tuning diarization inference %r", obj, exc_info=True)
+
+    # Known attribute layouts in pyannote 3.x pipelines.
+    candidates = [
+        getattr(pipeline, name, None)
+        for name in (
+            "segmentation",
+            "speech_turn_segmentation",
+            "speaker_segmentation",
+            "_segmentation_inference",
+            "_speech_turn_segmentation_inference",
+        )
+    ]
+
+    for item in candidates:
+        if item is None:
+            continue
+        if hasattr(item, "inference"):
+            _tune(getattr(item, "inference"))
+        elif hasattr(item, "_inference"):
+            _tune(getattr(item, "_inference"))
+        else:
+            _tune(item)
+
+    inference_map = getattr(pipeline, "_inference", None)
+    if isinstance(inference_map, dict):
+        for inference in inference_map.values():
+            _tune(inference)
+
+
+def _ensure_diarization_device(pipeline) -> None:
+    if not torch.cuda.is_available():
+        return
+    try:
+        pipeline.to("cuda")
+    except Exception:
+        logger.debug("Failed moving diarization pipeline to CUDA", exc_info=True)
+
+
+def _offload_diarization_pipeline() -> None:
+    if not torch.cuda.is_available():
+        return
+    try:
+        pipeline = _load_diarization_pipeline()
+    except Exception:
+        return
+
+    try:
+        pipeline.to("cpu")
+        torch.cuda.empty_cache()
+    except Exception:
+        logger.debug("Failed offloading diarization pipeline to CPU", exc_info=True)
 
 
 def _collect_sentence_segments(
@@ -364,7 +612,7 @@ def _estimate_question(path: Path) -> bool:
         return False
 
     try:
-        audio, sr = librosa.load(str(path), sr=TARGET_SAMPLE_RATE, mono=True)
+        audio, sample_rate = librosa.load(str(path), sr=TARGET_SAMPLE_RATE, mono=True)
     except Exception:
         return False
 
@@ -372,7 +620,7 @@ def _estimate_question(path: Path) -> bool:
         return False
 
     try:
-        f0, voiced_flag, _ = librosa.pyin(
+        f0, _, _ = librosa.pyin(
             audio,
             fmin=librosa.note_to_hz("C2"),
             fmax=librosa.note_to_hz("C6"),
@@ -398,6 +646,39 @@ def _estimate_question(path: Path) -> bool:
         return False
 
     return (tail - head) >= QUESTION_PITCH_DELTA
+
+def _build_sentence_chunk(
+    source: Path,
+    output_dir: Path,
+    index: int,
+    start_ms: int,
+    end_ms: int,
+    speaker: Optional[str],
+) -> Tuple[int, SentenceChunk]:
+    target_path = output_dir / f"sentence_{index:04d}.wav"
+    _extract_segment(source, start_ms, end_ms, target_path)
+    is_question = _estimate_question(target_path)
+
+    chunk = SentenceChunk(
+        path=target_path,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        speaker=speaker,
+        is_question=is_question,
+    )
+
+    return index, chunk
+
+
+def _suggest_sentence_workers(total_segments: int) -> int:
+    cpu_count = os.cpu_count() or 1
+    if total_segments <= 1 or cpu_count <= 1:
+        return 1
+
+    # Keep some headroom for ffmpeg/librosa workloads but avoid oversubscription.
+    upper_bound = 4 if torch.cuda.is_available() else 6
+    headroom = max(1, cpu_count - 1)
+    return max(1, min(upper_bound, total_segments, headroom))
 
 
 def _probe_duration_ms(source: Path) -> float:

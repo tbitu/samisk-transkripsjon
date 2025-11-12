@@ -156,13 +156,20 @@
       const annotationPercent = progressSnapshot.annotation ?? 0;
       const transcriptionPercent = progressSnapshot.transcription ?? 0;
       const overallPercent = progressSnapshot.overall ?? 0;
+      const task = (currentTask || '').toLowerCase();
 
       switch (phase) {
         case 'pending':
         case 'queued':
           return 'Waiting for worker…';
         case 'diarizing':
-          return `Annotation & diarization ${annotationPercent}% complete · Overall ${overallPercent}%`;
+          if (task.includes('chunking')) {
+            return `Sentence chunking ${annotationPercent}% complete · Overall ${overallPercent}%`;
+          }
+          if (task.includes('speaker')) {
+            return `Speaker diarization ${annotationPercent}% complete · Overall ${overallPercent}%`;
+          }
+          return `Annotation ${annotationPercent}% complete · Overall ${overallPercent}%`;
         case 'transcribing':
         case 'processing':
           return `Transcription ${transcriptionPercent}% complete · Overall ${overallPercent}%`;

@@ -89,9 +89,16 @@ class TranscriptionManager:
 
             def _update_progress(stage: str, fraction: float, info: Optional[Dict[str, object]] = None) -> None:
                 bounded = max(0.0, min(1.0, fraction))
+                details = info or {}
                 if stage == "diarization":
                     job.status = "diarizing"
-                    job.current_task = "annotation"
+                    phase = str(details.get("phase", "")).lower()
+                    if phase == "chunking":
+                        job.current_task = "sentence chunking"
+                    elif phase in {"pyannote", "diarization"}:
+                        job.current_task = "speaker diarization"
+                    else:
+                        job.current_task = "annotation"
                     job.diarization_progress = round(bounded * 100.0, 2)
                 elif stage == "transcription":
                     job.status = "transcribing"
