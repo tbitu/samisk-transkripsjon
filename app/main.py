@@ -9,6 +9,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .routes.transcription import router as transcription_router
+from pathlib import Path
+import os
+from fastapi import HTTPException
 
 app = FastAPI(
     title="Samisk Transkribering",
@@ -34,3 +37,24 @@ app.mount("/static", StaticFiles(directory=static_directory), name="static")
 async def index() -> FileResponse:
     index_path = static_directory / "index.html"
     return FileResponse(index_path)
+
+
+@app.on_event("startup")
+def ensure_diarization_token_available() -> None:
+    """Ensure a Hugging Face token is available for pyannote diarization."""
+    token = (
+        os.environ.get("PYANNOTE_AUTH_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+        or os.environ.get("HF_TOKEN")
+    )
+    if token:
+        return
+
+    token_file = Path(__file__).resolve().parents[1] / "hf_token"
+    if token_file.exists() and token_file.read_text().strip():
+        return
+
+    raise RuntimeError(
+        "Missing Hugging Face token required for speaker diarization. "
+        "Set PYANNOTE_AUTH_TOKEN/HUGGINGFACE_TOKEN/HF_TOKEN or place token in ./hf_token."
+    )

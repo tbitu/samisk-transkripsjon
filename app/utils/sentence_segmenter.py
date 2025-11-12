@@ -1,5 +1,7 @@
-"""Sentence-level speech segmentation utilities with speaker diarization support."""
 from __future__ import annotations
+
+"""Sentence-level speech segmentation utilities with speaker diarization support."""
+from . import torchaudio_compat  # ensure torchaudio API shims are applied early
 
 import logging
 import math
@@ -8,7 +10,7 @@ import shutil
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import ffmpeg
 import numpy as np
@@ -42,39 +44,57 @@ class SentenceChunk:
         return self.end_ms - self.start_ms
 
 
-def prepare_sentence_chunks(source: Path, output_dir: Path) -> List[SentenceChunk]:
+def prepare_sentence_chunks(
+    source: Path,
+    output_dir: Path,
+    *,
+    progress: Optional[Callable[[float, Optional[Dict[str, object]]], None]] = None,
+) -> List[SentenceChunk]:
     """Extract sentence-sized chunks with speaker labels when available."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Allow disabling diarization via environment when desired. Default: enabled.
-    enable = os.environ.get("ENABLE_DIARIZATION", "1")
-    if enable.lower() in ("0", "false", "no"):
-        logger.info("Diarization disabled via ENABLE_DIARIZATION; using fallback segmentation")
-        return _fallback_chunks(source, output_dir)
+    if progress:
+        progress(0.0, {"stage": "start"})
 
+    # Diarization is mandatory: always attempt diarization and fail loudly
     try:
-        diarization = _run_diarization(source)
-        diarized_chunks = list(_chunks_from_diarization(source, output_dir, diarization))
-        if diarized_chunks:
-            return diarized_chunks
-        logger.warning("Diarization yielded no chunks; falling back to silence-based split")
-    except Exception as exc:  # pragma: no cover - best-effort fallback
-        # If diarization is explicitly required and we appear to have a token,
-        # prefer to fail loudly so the calling job can surface the error instead
-        # of silently falling back.
-        required = os.environ.get("DIARIZATION_REQUIRED", "0").lower() in (
-            "1",
-            "true",
-            "yes",
+        diarization = _run_diarization(source, progress=progress)
+    except Exception as exc:  # pragma: no cover - external failures should surface
+        logger.error("Speaker diarization failed: %s", exc)
+        raise
+
+    segments_to_extract = _collect_sentence_segments(source, diarization)
+
+    if not segments_to_extract:
+        logger.error("Diarization completed but produced no chunks for %s", source)
+        raise RuntimeError("Diarization produced no chunks")
+
+    chunks: List[SentenceChunk] = []
+    total = len(segments_to_extract)
+
+    for index, (start_ms, end_ms, speaker) in enumerate(segments_to_extract):
+        target_path = output_dir / f"sentence_{index:04d}.wav"
+        _extract_segment(source, start_ms, end_ms, target_path)
+        is_question = _estimate_question(target_path)
+
+        chunks.append(
+            SentenceChunk(
+                path=target_path,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                speaker=speaker,
+                is_question=is_question,
+            )
         )
-        if required and _has_hf_token():
-            logger.error("Diarization required but failed: %s", exc)
-            raise
 
-        logger.warning("Speaker diarization unavailable (%s). Using fallback segmentation.", exc)
+        if progress:
+            progress(
+                (index + 1) / total,
+                {"completed": index + 1, "total": total},
+            )
 
-    return _fallback_chunks(source, output_dir)
+    return chunks
 
 
 def _has_hf_token() -> bool:
@@ -86,13 +106,49 @@ def _has_hf_token() -> bool:
     )
     if token:
         return True
-    token_file = Path(__file__).resolve().parents[1] / "hf_token"
+    token_file = Path(__file__).resolve().parents[2] / "hf_token"
     return token_file.exists() and token_file.read_text().strip() != ""
 
 
-def _run_diarization(source: Path):
+def _run_diarization(source: Path, progress: Optional[Callable[[float, Optional[Dict[str, object]]], None]] = None):
     pipeline = _load_diarization_pipeline()
-    return pipeline(str(source))
+
+    if not progress:
+        return pipeline(str(source))
+
+    class _HookAdapter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __call__(
+            self,
+            step_name: str,
+            step_artifact,
+            file: Optional[Mapping] = None,
+            total: Optional[int] = None,
+            completed: Optional[int] = None,
+        ) -> None:
+            try:
+                if total and completed is not None and total > 0:
+                    fraction = float(completed) / float(total)
+                elif completed is not None:
+                    fraction = 1.0 if completed > 0 else 0.0
+                else:
+                    fraction = 0.0
+
+                meta: Dict[str, object] = {
+                    "stage": step_name,
+                    "completed": completed,
+                    "total": total,
+                }
+                progress(fraction, meta)
+            except Exception:
+                logger.debug("Hook adapter failed to emit progress", exc_info=True)
+
+    return pipeline(str(source), hook=_HookAdapter())
 
 
 def _iter_diarization_turns(diarization) -> Iterable[tuple[float, float, str]]:
@@ -165,7 +221,7 @@ def _load_diarization_pipeline():  # pragma: no cover - external model loading
     )
     if not token:
         # fall back to a repository-local token file if present (hf_token)
-        token_file = Path(__file__).resolve().parents[1] / "hf_token"
+        token_file = Path(__file__).resolve().parents[2] / "hf_token"
         if token_file.exists():
             token = token_file.read_text().strip()
 
@@ -198,9 +254,12 @@ def _load_diarization_pipeline():  # pragma: no cover - external model loading
     return pipeline
 
 
-def _chunks_from_diarization(source: Path, output_dir: Path, diarization) -> Iterable[SentenceChunk]:
+def _collect_sentence_segments(
+    source: Path,
+    diarization,
+) -> List[tuple[int, int, Optional[str]]]:
     total_duration_ms = int(round(_probe_duration_ms(source)))
-    chunk_index = 0
+    segments: List[tuple[int, int, Optional[str]]] = []
 
     for start_s, end_s, speaker in _iter_diarization_turns(diarization):
         start_ms = int(round(max(0.0, start_s) * 1000))
@@ -214,18 +273,9 @@ def _chunks_from_diarization(source: Path, output_dir: Path, diarization) -> Ite
             if safe_end - safe_start < MIN_SENTENCE_DURATION_MS:
                 continue
 
-            target_path = output_dir / f"sentence_{chunk_index:04d}.wav"
-            _extract_segment(source, safe_start, safe_end, target_path)
-            is_question = _estimate_question(target_path)
+            segments.append((safe_start, safe_end, speaker))
 
-            yield SentenceChunk(
-                path=target_path,
-                start_ms=safe_start,
-                end_ms=safe_end,
-                speaker=speaker,
-                is_question=is_question,
-            )
-            chunk_index += 1
+    return segments
 
 
 def _segment_turn(start_ms: int, end_ms: int) -> Iterable[tuple[int, int]]:

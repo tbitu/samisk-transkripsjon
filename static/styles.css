@@ -165,6 +165,12 @@ body {
   gap: 1rem;
 }
 
+.progress-summary {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
 .progress-block {
   display: flex;
   flex-direction: column;

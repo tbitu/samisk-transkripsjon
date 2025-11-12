@@ -17,12 +17,16 @@ from .model_service import transcribe
 class TranscriptionJob:
     job_id: str
     source_path: Path
-    status: str = "queued"
+    status: str = "pending"
     text: Optional[str] = None
     segments: Optional[list] = None
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    diarization_progress: float = 0.0
+    transcription_progress: float = 0.0
+    overall_progress: float = 0.0
+    current_task: str = "pending"
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -33,6 +37,12 @@ class TranscriptionJob:
             "error": self.error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "progress": {
+                "annotation": self.diarization_progress,
+                "transcription": self.transcription_progress,
+                "overall": self.overall_progress,
+            },
+            "current_task": self.current_task,
         }
 
 
@@ -70,16 +80,43 @@ class TranscriptionManager:
             except Empty:
                 continue
 
-            job.status = "processing"
+            job.status = "diarizing"
+            job.current_task = "annotation"
+            job.diarization_progress = 0.0
+            job.transcription_progress = 0.0
+            job.overall_progress = 0.0
             job.updated_at = time.time()
+
+            def _update_progress(stage: str, fraction: float, info: Optional[Dict[str, object]] = None) -> None:
+                bounded = max(0.0, min(1.0, fraction))
+                if stage == "diarization":
+                    job.status = "diarizing"
+                    job.current_task = "annotation"
+                    job.diarization_progress = round(bounded * 100.0, 2)
+                elif stage == "transcription":
+                    job.status = "transcribing"
+                    job.current_task = "transcription"
+                    job.transcription_progress = round(bounded * 100.0, 2)
+
+                job.overall_progress = round(
+                    (job.diarization_progress + job.transcription_progress) / 2.0,
+                    2,
+                )
+                job.updated_at = time.time()
+
             try:
-                result = transcribe(job.source_path)
+                result = transcribe(job.source_path, progress=_update_progress)
                 job.text = result.get("text")
                 job.segments = result.get("chunks") or result.get("segments")
                 job.status = "completed"
+                job.current_task = "completed"
+                job.diarization_progress = 100.0
+                job.transcription_progress = 100.0
+                job.overall_progress = 100.0
             except Exception as exc:  # pragma: no cover - defensive logging hook
                 job.error = str(exc)
                 job.status = "failed"
+                job.current_task = "failed"
             finally:
                 job.updated_at = time.time()
                 self._queue.task_done()

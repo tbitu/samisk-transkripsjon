@@ -38,24 +38,25 @@
             <div id="progress-wrapper" class="progress-wrapper hidden" aria-live="polite">
               <div class="progress-block">
                 <div class="progress-label">
-                  <span id="current-progress-label">Current task</span>
-                  <span id="current-progress-value">0%</span>
+                  <span id="annotation-progress-label">Annotation &amp; diarization</span>
+                  <span id="annotation-progress-value">0%</span>
                 </div>
-                <div id="current-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Current task progress">
-                  <div id="current-progress-fill" class="progress-bar__fill"></div>
-                  <span id="current-progress-text" class="progress-bar__text">0%</span>
+                <div id="annotation-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Annotation progress">
+                  <div id="annotation-progress-fill" class="progress-bar__fill"></div>
+                  <span id="annotation-progress-text" class="progress-bar__text">0%</span>
                 </div>
               </div>
               <div class="progress-block">
                 <div class="progress-label">
-                  <span id="overall-progress-label">Overall progress</span>
-                  <span id="overall-progress-value">0%</span>
+                  <span id="transcription-progress-label">Transcription</span>
+                  <span id="transcription-progress-value">0%</span>
                 </div>
-                <div id="overall-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Overall transcription progress">
-                  <div id="overall-progress-fill" class="progress-bar__fill"></div>
-                  <span id="overall-progress-text" class="progress-bar__text">0%</span>
+                <div id="transcription-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Transcription progress">
+                  <div id="transcription-progress-fill" class="progress-bar__fill"></div>
+                  <span id="transcription-progress-text" class="progress-bar__text">0%</span>
                 </div>
               </div>
+              <div id="progress-summary" class="progress-summary" aria-live="polite">Overall 0%</div>
             </div>
 
             <button type="submit" id="submit-btn" class="button-primary">Start transcription</button>
@@ -99,24 +100,98 @@
     const downloadBtn = document.getElementById('download-btn');
     const submitBtn = document.getElementById('submit-btn');
     const progressWrapper = document.getElementById('progress-wrapper');
-    const currentProgressBar = document.getElementById('current-progress-bar');
-    const currentProgressFill = document.getElementById('current-progress-fill');
-    const currentProgressText = document.getElementById('current-progress-text');
-    const currentProgressLabel = document.getElementById('current-progress-label');
-    const currentProgressValue = document.getElementById('current-progress-value');
-    const overallProgressBar = document.getElementById('overall-progress-bar');
-    const overallProgressFill = document.getElementById('overall-progress-fill');
-    const overallProgressText = document.getElementById('overall-progress-text');
-    const overallProgressValue = document.getElementById('overall-progress-value');
+    const annotationProgressBar = document.getElementById('annotation-progress-bar');
+    const annotationProgressFill = document.getElementById('annotation-progress-fill');
+    const annotationProgressText = document.getElementById('annotation-progress-text');
+    const annotationProgressValue = document.getElementById('annotation-progress-value');
+    const transcriptionProgressBar = document.getElementById('transcription-progress-bar');
+    const transcriptionProgressFill = document.getElementById('transcription-progress-fill');
+    const transcriptionProgressText = document.getElementById('transcription-progress-text');
+    const transcriptionProgressValue = document.getElementById('transcription-progress-value');
+    const progressSummary = document.getElementById('progress-summary');
     const newUploadBtn = document.getElementById('new-upload-btn');
 
     let currentJobId = null;
     let pollTimer = null;
     let selectedFile = null;
-  let processingAnimationTimer = null;
-  let currentPhase = null;
-    let currentTaskPercent = 0;
-    let overallPercent = 0;
+    let currentPhase = null;
+    let lastProgress = { annotation: 0, transcription: 0, overall: 0 };
+
+    function clampPercent(value) {
+      if (typeof value !== 'number' || Number.isNaN(value)) {
+        return 0;
+      }
+      return Math.max(0, Math.min(100, value));
+    }
+
+    function updateProgressBars(annotation, transcription) {
+      const annotationValue = Math.round(clampPercent(annotation));
+      annotationProgressBar.setAttribute('aria-valuenow', String(annotationValue));
+      annotationProgressFill.style.width = `${annotationValue}%`;
+      annotationProgressText.textContent = `${annotationValue}%`;
+      annotationProgressValue.textContent = `${annotationValue}%`;
+
+      const transcriptionValue = Math.round(clampPercent(transcription));
+      transcriptionProgressBar.setAttribute('aria-valuenow', String(transcriptionValue));
+      transcriptionProgressFill.style.width = `${transcriptionValue}%`;
+      transcriptionProgressText.textContent = `${transcriptionValue}%`;
+      transcriptionProgressValue.textContent = `${transcriptionValue}%`;
+
+      const overallValue = Math.round((annotationValue + transcriptionValue) / 2);
+      if (progressSummary) {
+        progressSummary.textContent = `Overall ${overallValue}%`;
+      }
+
+      lastProgress = {
+        annotation: annotationValue,
+        transcription: transcriptionValue,
+        overall: overallValue,
+      };
+
+      return lastProgress;
+    }
+
+    function renderJobStatus(status, progressSnapshot, currentTask) {
+      const phase = status || currentTask || 'pending';
+      const annotationPercent = progressSnapshot.annotation ?? 0;
+      const transcriptionPercent = progressSnapshot.transcription ?? 0;
+      const overallPercent = progressSnapshot.overall ?? 0;
+
+      switch (phase) {
+        case 'pending':
+        case 'queued':
+          return 'Waiting for worker…';
+        case 'diarizing':
+          return `Annotation & diarization ${annotationPercent}% complete · Overall ${overallPercent}%`;
+        case 'transcribing':
+        case 'processing':
+          return `Transcription ${transcriptionPercent}% complete · Overall ${overallPercent}%`;
+        case 'completed':
+          return 'Transcription complete.';
+        case 'failed':
+          return 'Transcription failed.';
+        default:
+          return phase;
+      }
+    }
+
+    function applyJobUpdate(job) {
+      if (!job) {
+        return updateProgressBars(0, 0);
+      }
+
+      const annotation = Number(job.progress?.annotation ?? 0);
+      const transcription = Number(job.progress?.transcription ?? 0);
+
+      const snapshot = updateProgressBars(annotation, transcription);
+      jobStatusEl.textContent = renderJobStatus(job.status, snapshot, job.current_task);
+
+      if (job.status) {
+        setPhase(job.status);
+      }
+
+      return snapshot;
+    }
 
     function formatBytes(bytes) {
       if (bytes === 0) return '0 B';
@@ -156,112 +231,64 @@
       dropzone.setAttribute('aria-hidden', 'true');
     }
 
-    function stopProcessingAnimation() {
-      if (processingAnimationTimer) {
-        clearInterval(processingAnimationTimer);
-        processingAnimationTimer = null;
-      }
-    }
-
-    function setProgress({
-      currentLabel,
-      currentValue,
-      overallValue,
-    }) {
-      if (typeof currentLabel === 'string') {
-        currentProgressLabel.textContent = currentLabel;
-      }
-
-      if (typeof currentValue === 'number') {
-        currentTaskPercent = Math.max(0, Math.min(100, currentValue));
-        currentProgressBar.setAttribute('aria-valuenow', String(Math.round(currentTaskPercent)));
-        currentProgressFill.style.width = `${currentTaskPercent}%`;
-        const currentDisplay = `${Math.round(currentTaskPercent)}%`;
-        currentProgressText.textContent = currentDisplay;
-        currentProgressValue.textContent = currentDisplay;
-      }
-
-      if (typeof overallValue === 'number') {
-        overallPercent = Math.max(0, Math.min(100, overallValue));
-        overallProgressBar.setAttribute('aria-valuenow', String(Math.round(overallPercent)));
-        overallProgressFill.style.width = `${overallPercent}%`;
-        const overallDisplay = `${Math.round(overallPercent)}%`;
-        overallProgressText.textContent = overallDisplay;
-        overallProgressValue.textContent = overallDisplay;
-      }
-    }
-
-    function startProcessingAnimation() {
-      stopProcessingAnimation();
-      processingAnimationTimer = setInterval(() => {
-        if (currentPhase !== 'processing') {
-          stopProcessingAnimation();
-          return;
-        }
-        const nextTask = Math.min(95, currentTaskPercent + Math.random() * 5);
-        const nextOverall = Math.min(95, overallPercent + Math.random() * 3);
-        setProgress({ currentValue: nextTask, overallValue: nextOverall });
-      }, 1800);
-    }
-
     function setSubmitButton(label, disabled) {
       submitBtn.textContent = label;
       submitBtn.disabled = disabled;
     }
 
     function setPhase(phase) {
-      if (phase === currentPhase) {
+      const resolved = phase || 'idle';
+      if (resolved === currentPhase) {
         return;
       }
 
-      currentPhase = phase;
+      currentPhase = resolved;
 
-      switch (phase) {
+      switch (resolved) {
         case 'idle':
-          stopProcessingAnimation();
-          setProgress({ currentLabel: 'Current task', currentValue: 0, overallValue: 0 });
+          updateProgressBars(0, 0);
           progressWrapper.classList.add('hidden');
           showDropzone();
+          jobStatusEl.textContent = '';
           setSubmitButton('Start transcription', false);
           newUploadBtn.classList.add('hidden');
           break;
         case 'uploading':
           hideDropzone();
           progressWrapper.classList.remove('hidden');
-          setProgress({ currentLabel: 'Uploading file', currentValue: 15, overallValue: 15 });
+          updateProgressBars(0, 0);
           setSubmitButton('Uploading…', true);
           newUploadBtn.classList.add('hidden');
-          stopProcessingAnimation();
           break;
+        case 'pending':
         case 'queued':
           hideDropzone();
           progressWrapper.classList.remove('hidden');
-          setProgress({ currentLabel: 'Queued for transcription', currentValue: 35, overallValue: 35 });
           setSubmitButton('Processing…', true);
           newUploadBtn.classList.add('hidden');
-          stopProcessingAnimation();
           break;
+        case 'diarizing':
+          hideDropzone();
+          progressWrapper.classList.remove('hidden');
+          setSubmitButton('Processing…', true);
+          newUploadBtn.classList.add('hidden');
+          break;
+        case 'transcribing':
         case 'processing':
           hideDropzone();
           progressWrapper.classList.remove('hidden');
-          setProgress({ currentLabel: 'Transcribing audio', currentValue: 40, overallValue: 60 });
           setSubmitButton('Processing…', true);
           newUploadBtn.classList.add('hidden');
-          startProcessingAnimation();
           break;
         case 'completed':
           hideDropzone();
           progressWrapper.classList.remove('hidden');
-          stopProcessingAnimation();
-          setProgress({ currentLabel: 'Transcription complete', currentValue: 100, overallValue: 100 });
           setSubmitButton('Transcription complete', true);
           newUploadBtn.classList.remove('hidden');
           break;
         case 'failed':
           showDropzone();
           progressWrapper.classList.remove('hidden');
-          stopProcessingAnimation();
-          setProgress({ currentLabel: 'Processing failed', currentValue: 0, overallValue: 0 });
           setSubmitButton('Start transcription', false);
           newUploadBtn.classList.remove('hidden');
           break;
@@ -386,11 +413,10 @@
         const data = await response.json();
         currentJobId = data.job_id;
         outputPanel.classList.remove('hidden');
-        jobStatusEl.textContent = 'Processing…';
         transcriptText.value = '';
         transcriptText.disabled = true;
         setStatus('File uploaded. Transcription started.', 'success');
-        setPhase(data.status || 'queued');
+        applyJobUpdate(data);
         startPolling();
       } catch (error) {
         console.error(error);
@@ -409,8 +435,7 @@
             throw new Error('Failed to retrieve job status');
           }
           const data = await response.json();
-          jobStatusEl.textContent = data.status;
-          setPhase(data.status);
+          applyJobUpdate(data);
 
           if (data.status === 'completed') {
             clearInterval(pollTimer);
@@ -478,7 +503,6 @@
       setStatus('', '');
       setPhase('idle');
       currentJobId = null;
-      stopProcessingAnimation();
     });
   </script>
 </body>

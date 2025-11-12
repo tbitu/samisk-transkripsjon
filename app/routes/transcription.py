@@ -48,7 +48,16 @@ async def create_transcription(
     await file.close()
 
     job = manager.submit(temp_path)
-    return JSONResponse({"job_id": job.job_id, "status": job.status})
+    job_payload = job.as_dict()
+    return JSONResponse(
+        {
+            "job_id": job_payload["job_id"],
+            "status": job_payload["status"],
+            "progress": job_payload.get("progress", {}),
+            "current_task": job_payload.get("current_task"),
+        },
+        status_code=status.HTTP_202_ACCEPTED,
+    )
 
 
 @router.get("/{job_id}")

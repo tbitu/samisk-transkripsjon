@@ -6,7 +6,7 @@ import re
 from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
@@ -69,30 +69,78 @@ def get_asr_pipeline() -> Any:
     return pipe
 
 
-def transcribe(file_path: str | Path, *, temperature: float = 0.0) -> Dict[str, Any]:
+ProgressCallback = Callable[[str, float, Optional[Dict[str, Any]]], None]
+
+
+def transcribe(
+    file_path: str | Path,
+    *,
+    temperature: float = 0.0,
+    progress: Optional[ProgressCallback] = None,
+) -> Dict[str, Any]:
     """Run transcription on the given audio file."""
 
     pipeline_ = get_asr_pipeline()
     combined_blocks: List[Dict[str, Any]] = []
     combined_segments: List[Dict[str, Any]] = []
 
+    def _emit(stage: str, fraction: float, info: Optional[Dict[str, Any]] = None) -> None:
+        if not progress:
+            return
+        try:
+            progress(stage, fraction, info or {})
+        except Exception:  # pragma: no cover - progress callbacks are best effort
+            logger.debug("Progress callback failed", exc_info=True)
+
     with TemporaryDirectory(prefix="whisper_sentences_") as tmpdir:
-        sentence_chunks = prepare_sentence_chunks(Path(file_path), Path(tmpdir))
-        if not sentence_chunks:
+        diarization_progress: Optional[Callable[[float, Optional[Dict[str, Any]]], None]] = None
+
+        if progress:
+            _emit("diarization", 0.0, {"stage": "start"})
+
+            def diarization_progress(value: float, meta: Optional[Dict[str, Any]] = None) -> None:
+                _emit("diarization", value, meta)
+        else:
+            diarization_progress = None
+
+        sentence_chunks = prepare_sentence_chunks(
+            Path(file_path),
+            Path(tmpdir),
+            progress=diarization_progress,
+        )
+
+        total_chunks = len(sentence_chunks)
+
+        if total_chunks == 0:
             logger.warning("No voice activity detected in %s", file_path)
+            _emit("diarization", 1.0, {"chunks": 0})
+            _emit("transcription", 1.0, {"chunks": 0})
             return {"text": "", "chunks": []}
 
-        logger.info("Processing %d sentence chunks", len(sentence_chunks))
+        logger.info("Processing %d sentence chunks", total_chunks)
+        _emit("diarization", 1.0, {"chunks": total_chunks})
+        _emit("transcription", 0.0, {"total": total_chunks})
 
         inputs = [str(chunk.path) for chunk in sentence_chunks]
         pipeline_device = getattr(pipeline_, "device", None)
         batch_size = min(len(inputs), _default_batch_size(pipeline_device))
-        results = _batched_transcribe(
+
+        def _transcription_progress(processed: int, total: int) -> None:
+            if total <= 0:
+                fraction = 1.0
+            else:
+                fraction = processed / total
+            _emit("transcription", fraction, {"processed": processed, "total": total})
+
+        results = _transcribe_in_batches(
             pipeline_,
             inputs,
             batch_size=batch_size,
             temperature=temperature,
+            progress=_transcription_progress if progress else None,
         )
+
+        _emit("transcription", 1.0, {"processed": total_chunks, "total": total_chunks})
 
         for chunk, result in zip(sentence_chunks, results):
             raw_text = (result or {}).get("text", "")
@@ -138,48 +186,68 @@ def _default_batch_size(device: Any) -> int:
     return 1
 
 
-def _batched_transcribe(
+def _transcribe_in_batches(
     pipeline_: Any,
     inputs: List[str],
     *,
     batch_size: int,
     temperature: float,
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> List[Dict[str, Any]]:
     if not inputs:
+        if progress:
+            progress(0, 0)
         return []
 
-    try:
-        outputs = pipeline_(
-            inputs,
-            batch_size=batch_size,
-            return_timestamps=True,
-            generate_kwargs={"temperature": temperature},
-        )
-    except ValueError as exc:
-        message = str(exc)
-        if "Whisper did not predict an ending timestamp" in message:
-            if len(inputs) == 1:
-                fallback = pipeline_(
-                    inputs,
-                    batch_size=1,
-                    return_timestamps=False,
-                    generate_kwargs={"temperature": temperature},
-                )
-                return fallback if isinstance(fallback, list) else [fallback]
+    total = len(inputs)
+    processed = 0
+    outputs: List[Dict[str, Any]] = []
 
-            outputs: List[Dict[str, Any]] = []
-            for item in inputs:
-                outputs.extend(
-                    _batched_transcribe(
-                        pipeline_, [item], batch_size=1, temperature=temperature
+    for start in range(0, total, batch_size):
+        batch_inputs = inputs[start : start + batch_size]
+        try:
+            batch_outputs = pipeline_(
+                batch_inputs,
+                batch_size=len(batch_inputs),
+                return_timestamps=True,
+                generate_kwargs={"temperature": temperature},
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "Whisper did not predict an ending timestamp" in message:
+                for item in batch_inputs:
+                    single_output = pipeline_(
+                        [item],
+                        batch_size=1,
+                        return_timestamps=False,
+                        generate_kwargs={"temperature": temperature},
                     )
-                )
-            return outputs
-        raise
+                    if isinstance(single_output, dict):
+                        batch_single = [single_output]
+                    else:
+                        batch_single = list(single_output)
 
-    if isinstance(outputs, dict):
-        return [outputs]
-    return list(outputs)
+                    outputs.extend(batch_single)
+                    processed += len(batch_single)
+                    if progress:
+                        progress(processed, total)
+                continue
+            raise
+
+        if isinstance(batch_outputs, dict):
+            batch_list = [batch_outputs]
+        else:
+            batch_list = list(batch_outputs)
+
+        outputs.extend(batch_list)
+        processed += len(batch_list)
+        if progress:
+            progress(processed, total)
+
+    if progress:
+        progress(total, total)
+
+    return outputs
 
 
 QUESTION_WORDS = {
