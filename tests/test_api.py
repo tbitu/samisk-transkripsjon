@@ -28,10 +28,9 @@ class DummyManager:
             text="stub transcription",
             segments=[{"text": "stub"}],
         )
-        job.diarization_progress = 100.0
-        job.transcription_progress = 100.0
         job.overall_progress = 100.0
-        job.current_task = "completed"
+        job.current_step = "Completed"
+        job.step_progress = 100.0
         self.jobs[job_id] = job
         return job
 
@@ -65,8 +64,9 @@ def test_transcription_flow(client: TestClient):
     assert payload["job_id"] == "test-job"
     assert payload["status"] == "completed"
     assert "progress" in payload
-    assert payload["progress"]["annotation"] == pytest.approx(100.0)
-    assert payload["current_task"] == "completed"
+    assert payload["progress"]["overall"] == pytest.approx(100.0)
+    assert payload["progress"]["step"] == pytest.approx(100.0)
+    assert payload["current_step"] == "Completed"
 
     status_resp = client.get(f"/api/transcriptions/{payload['job_id']}")
     assert status_resp.status_code == 200

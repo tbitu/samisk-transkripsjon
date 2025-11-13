@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from typing import Tuple
 
 from ..utils.sentence_segmenter import prepare_sentence_chunks
 
@@ -37,8 +38,24 @@ def _resolve_dtype(device: int | str) -> torch.dtype:
 @lru_cache(maxsize=1)
 def get_asr_pipeline() -> Any:
     """Load and cache the speech recognition pipeline."""
+    import gc
+    
     device = _resolve_device()
     torch_dtype = _resolve_dtype(device)
+
+    # Ensure clean GPU state before loading the large Whisper model
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # Log available memory
+        try:
+            free_memory = torch.cuda.mem_get_info(0)[0] / 1024**3
+            total_memory = torch.cuda.mem_get_info(0)[1] / 1024**3
+            logger.info(f"Loading Whisper model - GPU free: {free_memory:.2f}GB / {total_memory:.2f}GB")
+        except Exception:
+            pass
 
     logger.info("Loading model %s", MODEL_ID)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -64,13 +81,20 @@ def get_asr_pipeline() -> Any:
 
     processor = AutoProcessor.from_pretrained(MODEL_ID)
 
+    # Clear deprecated forced_decoder_ids from generation config
+    # These are deprecated in favor of task and language parameters
+    if hasattr(model, 'generation_config') and model.generation_config is not None:
+        if hasattr(model.generation_config, 'forced_decoder_ids'):
+            model.generation_config.forced_decoder_ids = None
+            logger.debug("Cleared deprecated forced_decoder_ids from generation config")
+
     pipe = pipeline(
         task="automatic-speech-recognition",
         model=model,
         tokenizer=processor.tokenizer,
         feature_extractor=processor.feature_extractor,
-        max_new_tokens=400,
-        chunk_length_s=15,
+        max_new_tokens=444,  # 448 max_target_positions - 4 for decoder input tokens and safety margin
+        chunk_length_s=30,
         batch_size=_default_batch_size(device),
         torch_dtype=torch_dtype,
         device=device if isinstance(device, int) else -1,
@@ -81,6 +105,93 @@ def get_asr_pipeline() -> Any:
 
 
 ProgressCallback = Callable[[str, float, Optional[Dict[str, Any]]], None]
+
+
+def _cleanup_preprocessing_models() -> None:
+    """Clear all preprocessing models from GPU memory before transcription.
+    
+    IMPORTANT: This clears models in reverse order of usage to ensure clean GPU memory:
+    1. Diarization (pyannote) - used first, cleared first
+    2. VAD (Silero) - used second, cleared second  
+    3. Stanza (punctuation) - used last, cleared last
+    
+    Each model is moved to CPU, cache cleared, and GPU synchronized before moving to next.
+    """
+    import gc
+    import time
+    
+    logger.info("Clearing preprocessing models from GPU memory in sequence...")
+    
+    # Step 1: Clear diarization pipeline (pyannote)
+    # This was already done in prepare_sentence_chunks, but ensure it's cleared
+    try:
+        from ..utils.sentence_segmenter import _offload_diarization_pipeline, _load_diarization_pipeline
+        _offload_diarization_pipeline()
+        logger.info("✓ Diarization pipeline cleared")
+        
+        # Synchronize after each model and add grace period
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            gc.collect()
+            time.sleep(0.3)  # Grace period for GPU driver cleanup
+    except Exception as exc:
+        logger.debug("Could not offload diarization pipeline: %s", exc)
+    
+    # Step 2: Clear VAD model (Silero)
+    # This was already done in prepare_sentence_chunks, but ensure it's cleared
+    try:
+        from ..utils.vad import clear_vad_from_memory
+        clear_vad_from_memory()
+        logger.info("✓ VAD model cleared")
+        
+        # Synchronize after each model and add grace period
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            gc.collect()
+            time.sleep(0.3)  # Grace period for GPU driver cleanup
+    except Exception as exc:
+        logger.debug("Could not clear VAD from memory: %s", exc)
+    
+    # Step 3: Clear Stanza NLP models (used during punctuation)
+    # This is critical as Stanza may have been loaded during _format_sentence calls
+    try:
+        from ..utils.punctuation import clear_stanza_from_memory
+        clear_stanza_from_memory()
+        logger.info("✓ Stanza models cleared")
+        
+        # Final synchronization and grace period
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            gc.collect()
+            time.sleep(0.3)  # Grace period for GPU driver cleanup
+    except Exception as exc:
+        logger.debug("Could not clear Stanza from memory: %s", exc)
+    
+    # Final cleanup: Force garbage collection and clear CUDA cache
+    for _ in range(3):
+        gc.collect()
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # Final grace period before Whisper loads
+        time.sleep(0.5)
+        
+        # Log memory status
+        try:
+            allocated = torch.cuda.memory_allocated(0) / 1024**3
+            reserved = torch.cuda.memory_reserved(0) / 1024**3
+            free_memory = torch.cuda.mem_get_info(0)[0] / 1024**3
+            total_memory = torch.cuda.mem_get_info(0)[1] / 1024**3
+            logger.info(
+                f"GPU memory after cleanup - Allocated: {allocated:.2f}GB, "
+                f"Reserved: {reserved:.2f}GB, Free: {free_memory:.2f}GB / {total_memory:.2f}GB"
+            )
+        except Exception:
+            pass
+        
+        logger.info("All preprocessing models cleared, GPU ready for Whisper transcription")
 
 
 def _reconcile_chunks_with_whisper_timestamps(
@@ -198,7 +309,6 @@ def transcribe(
 ) -> Dict[str, Any]:
     """Run transcription on the given audio file."""
 
-    pipeline_ = get_asr_pipeline()
     combined_blocks: List[Dict[str, Any]] = []
     combined_segments: List[Dict[str, Any]] = []
 
@@ -227,6 +337,44 @@ def transcribe(
             progress=diarization_progress,
         )
 
+        # Log GPU memory before cleanup
+        if torch.cuda.is_available():
+            try:
+                allocated_before = torch.cuda.memory_allocated(0) / 1024**3
+                reserved_before = torch.cuda.memory_reserved(0) / 1024**3
+                free_before = torch.cuda.mem_get_info(0)[0] / 1024**3
+                logger.info(f"GPU before preprocessing cleanup - Allocated: {allocated_before:.2f}GB, Reserved: {reserved_before:.2f}GB, Free: {free_before:.2f}GB")
+            except Exception:
+                pass
+
+        # CRITICAL: Free GPU memory from diarization, VAD, and Stanza before loading Whisper
+        _cleanup_preprocessing_models()
+
+        # Log GPU memory after cleanup, before Whisper loads
+        if torch.cuda.is_available():
+            try:
+                allocated_after = torch.cuda.memory_allocated(0) / 1024**3
+                reserved_after = torch.cuda.memory_reserved(0) / 1024**3
+                free_after = torch.cuda.mem_get_info(0)[0] / 1024**3
+                freed = free_after - free_before
+                logger.info(f"GPU after preprocessing cleanup - Allocated: {allocated_after:.2f}GB, Reserved: {reserved_after:.2f}GB, Free: {free_after:.2f}GB (freed {freed:.2f}GB)")
+            except Exception:
+                pass
+
+        # NOW load the Whisper pipeline after cleanup
+        logger.info("Loading Whisper model for transcription...")
+        pipeline_ = get_asr_pipeline()
+        
+        # Log GPU memory after Whisper loads
+        if torch.cuda.is_available():
+            try:
+                allocated_whisper = torch.cuda.memory_allocated(0) / 1024**3
+                reserved_whisper = torch.cuda.memory_reserved(0) / 1024**3
+                free_whisper = torch.cuda.mem_get_info(0)[0] / 1024**3
+                logger.info(f"GPU after Whisper loaded - Allocated: {allocated_whisper:.2f}GB, Reserved: {reserved_whisper:.2f}GB, Free: {free_whisper:.2f}GB")
+            except Exception:
+                pass
+
         total_chunks = len(sentence_chunks)
 
         if total_chunks == 0:
@@ -242,6 +390,7 @@ def transcribe(
         inputs = [str(chunk.path) for chunk in sentence_chunks]
         pipeline_device = getattr(pipeline_, "device", None)
         batch_size = min(len(inputs), _default_batch_size(pipeline_device))
+        logger.info(f"Using batch_size={batch_size} for transcription (processing {batch_size} chunk(s) at a time)")
 
         def _transcription_progress(processed: int, total: int) -> None:
             if total <= 0:
@@ -260,11 +409,51 @@ def transcribe(
 
         _emit("transcription", 1.0, {"processed": total_chunks, "total": total_chunks})
 
-        for chunk, result in zip(sentence_chunks, results):
+        # CRITICAL: Clear Whisper from GPU before loading Stanza for punctuation
+        # This prevents OOM errors when formatting sentences
+        logger.info("Transcription complete, clearing Whisper from GPU for punctuation...")
+        
+        # Log GPU memory before Whisper cleanup
+        if torch.cuda.is_available():
+            try:
+                allocated_before = torch.cuda.memory_allocated(0) / 1024**3
+                reserved_before = torch.cuda.memory_reserved(0) / 1024**3
+                free_before = torch.cuda.mem_get_info(0)[0] / 1024**3
+                logger.info(f"GPU before Whisper cleanup - Allocated: {allocated_before:.2f}GB, Reserved: {reserved_before:.2f}GB, Free: {free_before:.2f}GB")
+            except Exception:
+                pass
+        
+        del pipeline_
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            import time
+            time.sleep(0.3)  # Grace period for GPU driver
+            
+            # Log GPU memory after Whisper cleanup
+            try:
+                allocated_after = torch.cuda.memory_allocated(0) / 1024**3
+                reserved_after = torch.cuda.memory_reserved(0) / 1024**3
+                free_after = torch.cuda.mem_get_info(0)[0] / 1024**3
+                freed = free_after - free_before
+                logger.info(f"GPU after Whisper cleanup - Allocated: {allocated_after:.2f}GB, Reserved: {reserved_after:.2f}GB, Free: {free_after:.2f}GB (freed {freed:.2f}GB)")
+            except Exception:
+                pass
+        
+        logger.info("✓ Whisper cleared, GPU freed for Stanza punctuation")
+
+        # Now process results with Stanza (which will be loaded on-demand)
+        _emit("punctuation", 0.0, {"total": total_chunks})
+        
+        for idx, (chunk, result) in enumerate(zip(sentence_chunks, results), 1):
             raw_text = (result or {}).get("text", "")
             formatted_text, is_question = _format_sentence(raw_text, chunk.is_question)
             if not formatted_text:
                 continue
+            
+            # Report punctuation progress
+            if idx % 5 == 0 or idx == total_chunks:  # Report every 5 chunks or at the end
+                _emit("punctuation", idx / total_chunks, {"processed": idx, "total": total_chunks})
 
             # Reconcile chunks using Whisper word timestamps
             # This may split one chunk into multiple sentences
@@ -324,10 +513,7 @@ def transcribe(
 
 
 def _default_batch_size(device: Any) -> int:
-    if isinstance(device, torch.device):
-        return 4 if device.type == "cuda" else 1
-    if isinstance(device, int):
-        return 4
+    # Use batch size of 1 to be conservative with GPU memory.
     return 1
 
 
@@ -350,23 +536,35 @@ def _transcribe_in_batches(
 
     for start in range(0, total, batch_size):
         batch_inputs = inputs[start : start + batch_size]
+        logger.info(f"Transcribing batch {start//batch_size + 1}/{(total + batch_size - 1)//batch_size}: processing {len(batch_inputs)} chunk(s) (chunks {start+1}-{start+len(batch_inputs)} of {total})")
         try:
             batch_outputs = pipeline_(
                 batch_inputs,
                 batch_size=len(batch_inputs),
-                return_timestamps="word",  # Request word-level timestamps
-                generate_kwargs={"temperature": temperature},
+                return_timestamps=True,  # Enable timestamps (will return word-level)
+                generate_kwargs={
+                    "task": "transcribe",
+                    "temperature": temperature,
+                },
             )
-        except ValueError as exc:
+        except (ValueError, RuntimeError) as exc:
             message = str(exc)
-            if "Whisper did not predict an ending timestamp" in message:
+            if "Whisper did not predict an ending timestamp" in message or "timestamp" in message.lower():
+                logger.warning(
+                    "Timestamp prediction failed for batch starting at chunk %d/%d: %s. "
+                    "Falling back to text-only transcription.",
+                    start + 1, total, message
+                )
                 # Fallback to no timestamps for problematic chunks
                 for item in batch_inputs:
                     single_output = pipeline_(
                         [item],
                         batch_size=1,
                         return_timestamps=False,
-                        generate_kwargs={"temperature": temperature},
+                        generate_kwargs={
+                            "task": "transcribe",
+                            "temperature": temperature,
+                        },
                     )
                     if isinstance(single_output, dict):
                         batch_single = [single_output]

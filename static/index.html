@@ -15,6 +15,34 @@
       </div>
     </header>
 
+    <!-- Server Busy Panel -->
+    <div id="server-busy-panel" class="panel panel-busy hidden" aria-live="polite">
+      <div class="panel-body">
+        <div class="busy-content">
+          <div class="busy-icon" aria-hidden="true">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <polyline points="12 6 12 12 16 14"/>
+            </svg>
+          </div>
+          <h2>Server Busy</h2>
+          <p id="busy-message">Another transcription is currently in progress.</p>
+          <div class="progress-block">
+            <div class="progress-label">
+              <span id="busy-step-label">Processing</span>
+              <span id="busy-progress-value">0%</span>
+            </div>
+            <div id="busy-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Server progress">
+              <div id="busy-progress-fill" class="progress-bar__fill"></div>
+              <span id="busy-progress-text" class="progress-bar__text">0%</span>
+            </div>
+          </div>
+          <p id="busy-time-estimate" class="busy-time-estimate"></p>
+          <button id="refresh-btn" class="button-secondary">Check Again</button>
+        </div>
+      </div>
+    </div>
+
     <div class="layout">
       <section class="panel panel-upload">
         <div class="panel-body">
@@ -38,25 +66,24 @@
             <div id="progress-wrapper" class="progress-wrapper hidden" aria-live="polite">
               <div class="progress-block">
                 <div class="progress-label">
-                  <span id="annotation-progress-label">Annotation &amp; diarization</span>
-                  <span id="annotation-progress-value">0%</span>
+                  <span id="current-step-label">Current Task</span>
+                  <span id="current-step-value">0%</span>
                 </div>
-                <div id="annotation-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Annotation progress">
-                  <div id="annotation-progress-fill" class="progress-bar__fill"></div>
-                  <span id="annotation-progress-text" class="progress-bar__text">0%</span>
+                <div id="current-step-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Current task progress">
+                  <div id="current-step-fill" class="progress-bar__fill"></div>
+                  <span id="current-step-text" class="progress-bar__text">0%</span>
                 </div>
               </div>
               <div class="progress-block">
                 <div class="progress-label">
-                  <span id="transcription-progress-label">Transcription</span>
-                  <span id="transcription-progress-value">0%</span>
+                  <span id="overall-progress-label">Overall Progress</span>
+                  <span id="overall-progress-value">0%</span>
                 </div>
-                <div id="transcription-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Transcription progress">
-                  <div id="transcription-progress-fill" class="progress-bar__fill"></div>
-                  <span id="transcription-progress-text" class="progress-bar__text">0%</span>
+                <div id="overall-progress-bar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Overall progress">
+                  <div id="overall-progress-fill" class="progress-bar__fill"></div>
+                  <span id="overall-progress-text" class="progress-bar__text">0%</span>
                 </div>
               </div>
-              <div id="progress-summary" class="progress-summary" aria-live="polite">Overall 0%</div>
             </div>
 
             <button type="submit" id="submit-btn" class="button-primary">Start transcription</button>
@@ -71,7 +98,6 @@
           <div class="output-header">
             <div>
               <h2>Transcript</h2>
-              <div id="job-status" class="job-status"></div>
             </div>
             <div class="action-buttons">
               <button id="save-btn" class="button-primary" disabled>Save corrections</button>
@@ -94,28 +120,127 @@
     const fileSummary = document.getElementById('file-summary');
     const statusEl = document.getElementById('status');
     const outputPanel = document.getElementById('output-panel');
-    const jobStatusEl = document.getElementById('job-status');
     const transcriptText = document.getElementById('transcript-text');
     const saveBtn = document.getElementById('save-btn');
     const downloadBtn = document.getElementById('download-btn');
     const submitBtn = document.getElementById('submit-btn');
     const progressWrapper = document.getElementById('progress-wrapper');
-    const annotationProgressBar = document.getElementById('annotation-progress-bar');
-    const annotationProgressFill = document.getElementById('annotation-progress-fill');
-    const annotationProgressText = document.getElementById('annotation-progress-text');
-    const annotationProgressValue = document.getElementById('annotation-progress-value');
-    const transcriptionProgressBar = document.getElementById('transcription-progress-bar');
-    const transcriptionProgressFill = document.getElementById('transcription-progress-fill');
-    const transcriptionProgressText = document.getElementById('transcription-progress-text');
-    const transcriptionProgressValue = document.getElementById('transcription-progress-value');
-    const progressSummary = document.getElementById('progress-summary');
+    const currentStepBar = document.getElementById('current-step-bar');
+    const currentStepFill = document.getElementById('current-step-fill');
+    const currentStepText = document.getElementById('current-step-text');
+    const currentStepValue = document.getElementById('current-step-value');
+    const currentStepLabel = document.getElementById('current-step-label');
+    const overallProgressBar = document.getElementById('overall-progress-bar');
+    const overallProgressFill = document.getElementById('overall-progress-fill');
+    const overallProgressText = document.getElementById('overall-progress-text');
+    const overallProgressValue = document.getElementById('overall-progress-value');
     const newUploadBtn = document.getElementById('new-upload-btn');
+    const serverBusyPanel = document.getElementById('server-busy-panel');
+    const busyMessage = document.getElementById('busy-message');
+    const busyStepLabel = document.getElementById('busy-step-label');
+    const busyProgressValue = document.getElementById('busy-progress-value');
+    const busyProgressBar = document.getElementById('busy-progress-bar');
+    const busyProgressFill = document.getElementById('busy-progress-fill');
+    const busyProgressText = document.getElementById('busy-progress-text');
+    const busyTimeEstimate = document.getElementById('busy-time-estimate');
+    const refreshBtn = document.getElementById('refresh-btn');
 
     let currentJobId = null;
+    let currentSessionId = null;
     let pollTimer = null;
+    let busyPollTimer = null;
     let selectedFile = null;
     let currentPhase = null;
-    let lastProgress = { annotation: 0, transcription: 0, overall: 0 };
+    let lastProgress = { step: 0, overall: 0, stepName: 'Starting' };
+
+    // Session management
+    const SESSION_KEY = 'samisk_transcription_session';
+    const SESSION_ID_KEY = 'samisk_session_id';
+
+    function saveSession(jobId, sessionId) {
+      if (jobId) {
+        localStorage.setItem(SESSION_KEY, jobId);
+      }
+      if (sessionId) {
+        localStorage.setItem(SESSION_ID_KEY, sessionId);
+      }
+    }
+
+    function loadSession() {
+      return {
+        jobId: localStorage.getItem(SESSION_KEY),
+        sessionId: localStorage.getItem(SESSION_ID_KEY)
+      };
+    }
+
+    function clearSession() {
+      localStorage.removeItem(SESSION_KEY);
+      localStorage.removeItem(SESSION_ID_KEY);
+      currentSessionId = null;
+    }
+
+    function formatTimeRemaining(seconds) {
+      if (!seconds || seconds < 0) return '';
+      
+      const mins = Math.ceil(seconds / 60);
+      if (mins < 2) return 'Less than a minute remaining';
+      if (mins < 60) return `Approximately ${mins} minutes remaining`;
+      
+      const hours = Math.floor(mins / 60);
+      const remainingMins = mins % 60;
+      if (remainingMins === 0) return `Approximately ${hours} hour${hours > 1 ? 's' : ''} remaining`;
+      return `Approximately ${hours} hour${hours > 1 ? 's' : ''} and ${remainingMins} minutes remaining`;
+    }
+
+    function showServerBusy(activeJob) {
+      serverBusyPanel.classList.remove('hidden');
+      document.querySelector('.layout').classList.add('hidden');
+      
+      const progress = Math.round(clampPercent(activeJob.progress?.overall || 0));
+      busyProgressBar.setAttribute('aria-valuenow', String(progress));
+      busyProgressFill.style.width = `${progress}%`;
+      busyProgressText.textContent = `${progress}%`;
+      busyProgressValue.textContent = `${progress}%`;
+      
+      const stepName = activeJob.current_step || 'Processing';
+      busyStepLabel.textContent = stepName;
+      
+      if (activeJob.estimated_time_remaining) {
+        busyTimeEstimate.textContent = formatTimeRemaining(activeJob.estimated_time_remaining);
+      } else {
+        busyTimeEstimate.textContent = 'Calculating time estimate...';
+      }
+      
+      // Start polling server status
+      if (busyPollTimer) clearInterval(busyPollTimer);
+      busyPollTimer = setInterval(checkServerStatus, 5000);
+    }
+
+    function hideServerBusy() {
+      serverBusyPanel.classList.add('hidden');
+      document.querySelector('.layout').classList.remove('hidden');
+      if (busyPollTimer) {
+        clearInterval(busyPollTimer);
+        busyPollTimer = null;
+      }
+    }
+
+    async function checkServerStatus() {
+      try {
+        const response = await fetch('/api/transcriptions/status');
+        if (!response.ok) return;
+        
+        const data = await response.json();
+        
+        if (data.busy && data.active_job) {
+          showServerBusy(data.active_job);
+        } else {
+          hideServerBusy();
+        }
+      } catch (error) {
+        console.error('Failed to check server status:', error);
+      }
+    }
 
     function clampPercent(value) {
       if (typeof value !== 'number' || Number.isNaN(value)) {
@@ -124,74 +249,62 @@
       return Math.max(0, Math.min(100, value));
     }
 
-    function updateProgressBars(annotation, transcription) {
-      const annotationValue = Math.round(clampPercent(annotation));
-      annotationProgressBar.setAttribute('aria-valuenow', String(annotationValue));
-      annotationProgressFill.style.width = `${annotationValue}%`;
-      annotationProgressText.textContent = `${annotationValue}%`;
-      annotationProgressValue.textContent = `${annotationValue}%`;
+    function updateProgressBars(stepProgress, overallProgress, stepName) {
+      const stepValue = Math.round(clampPercent(stepProgress));
+      currentStepBar.setAttribute('aria-valuenow', String(stepValue));
+      currentStepFill.style.width = `${stepValue}%`;
+      currentStepText.textContent = `${stepValue}%`;
+      currentStepValue.textContent = `${stepValue}%`;
 
-      const transcriptionValue = Math.round(clampPercent(transcription));
-      transcriptionProgressBar.setAttribute('aria-valuenow', String(transcriptionValue));
-      transcriptionProgressFill.style.width = `${transcriptionValue}%`;
-      transcriptionProgressText.textContent = `${transcriptionValue}%`;
-      transcriptionProgressValue.textContent = `${transcriptionValue}%`;
+      const overallValue = Math.round(clampPercent(overallProgress));
+      overallProgressBar.setAttribute('aria-valuenow', String(overallValue));
+      overallProgressFill.style.width = `${overallValue}%`;
+      overallProgressText.textContent = `${overallValue}%`;
+      overallProgressValue.textContent = `${overallValue}%`;
 
-      const overallValue = Math.round((annotationValue + transcriptionValue) / 2);
-      if (progressSummary) {
-        progressSummary.textContent = `Overall ${overallValue}%`;
-      }
+      // Update the step name label
+      const displayStepName = stepName || 'Processing';
+      currentStepLabel.textContent = displayStepName;
 
       lastProgress = {
-        annotation: annotationValue,
-        transcription: transcriptionValue,
+        step: stepValue,
         overall: overallValue,
+        stepName: displayStepName,
       };
 
       return lastProgress;
     }
 
-    function renderJobStatus(status, progressSnapshot, currentTask) {
-      const phase = status || currentTask || 'pending';
-      const annotationPercent = progressSnapshot.annotation ?? 0;
-      const transcriptionPercent = progressSnapshot.transcription ?? 0;
+    function renderJobStatus(status, progressSnapshot, currentStep) {
+      const phase = status || 'pending';
       const overallPercent = progressSnapshot.overall ?? 0;
-      const task = (currentTask || '').toLowerCase();
+      const stepName = progressSnapshot.stepName || currentStep || 'Starting';
 
       switch (phase) {
         case 'pending':
         case 'queued':
           return 'Waiting for worker…';
-        case 'diarizing':
-          if (task.includes('chunking')) {
-            return `Sentence chunking ${annotationPercent}% complete · Overall ${overallPercent}%`;
-          }
-          if (task.includes('speaker')) {
-            return `Speaker diarization ${annotationPercent}% complete · Overall ${overallPercent}%`;
-          }
-          return `Annotation ${annotationPercent}% complete · Overall ${overallPercent}%`;
-        case 'transcribing':
         case 'processing':
-          return `Transcription ${transcriptionPercent}% complete · Overall ${overallPercent}%`;
+          return `${stepName} · Overall ${overallPercent}%`;
         case 'completed':
           return 'Transcription complete.';
         case 'failed':
           return 'Transcription failed.';
         default:
-          return phase;
+          return `${stepName} · Overall ${overallPercent}%`;
       }
     }
 
     function applyJobUpdate(job) {
       if (!job) {
-        return updateProgressBars(0, 0);
+        return updateProgressBars(0, 0, 'Starting');
       }
 
-      const annotation = Number(job.progress?.annotation ?? 0);
-      const transcription = Number(job.progress?.transcription ?? 0);
+      const stepProgress = Number(job.progress?.step ?? 0);
+      const overallProgress = Number(job.progress?.overall ?? 0);
+      const stepName = job.current_step || 'Starting';
 
-      const snapshot = updateProgressBars(annotation, transcription);
-      jobStatusEl.textContent = renderJobStatus(job.status, snapshot, job.current_task);
+      const snapshot = updateProgressBars(stepProgress, overallProgress, stepName);
 
       if (job.status) {
         setPhase(job.status);
@@ -216,7 +329,6 @@
 
     function resetOutput() {
       outputPanel.classList.add('hidden');
-      jobStatusEl.textContent = '';
       transcriptText.value = '';
       transcriptText.disabled = true;
       saveBtn.disabled = true;
@@ -253,17 +365,16 @@
 
       switch (resolved) {
         case 'idle':
-          updateProgressBars(0, 0);
+          updateProgressBars(0, 0, 'Starting');
           progressWrapper.classList.add('hidden');
           showDropzone();
-          jobStatusEl.textContent = '';
           setSubmitButton('Start transcription', false);
           newUploadBtn.classList.add('hidden');
           break;
         case 'uploading':
           hideDropzone();
           progressWrapper.classList.remove('hidden');
-          updateProgressBars(0, 0);
+          updateProgressBars(0, 0, 'Uploading');
           setSubmitButton('Uploading…', true);
           newUploadBtn.classList.add('hidden');
           break;
@@ -274,13 +385,6 @@
           setSubmitButton('Processing…', true);
           newUploadBtn.classList.add('hidden');
           break;
-        case 'diarizing':
-          hideDropzone();
-          progressWrapper.classList.remove('hidden');
-          setSubmitButton('Processing…', true);
-          newUploadBtn.classList.add('hidden');
-          break;
-        case 'transcribing':
         case 'processing':
           hideDropzone();
           progressWrapper.classList.remove('hidden');
@@ -419,6 +523,8 @@
 
         const data = await response.json();
         currentJobId = data.job_id;
+        currentSessionId = data.session_id;
+        saveSession(currentJobId, currentSessionId);
         outputPanel.classList.remove('hidden');
         transcriptText.value = '';
         transcriptText.disabled = true;
@@ -437,7 +543,11 @@
       pollTimer = setInterval(async () => {
         if (!currentJobId) return;
         try {
-          const response = await fetch(`/api/transcriptions/${currentJobId}`);
+          const headers = {};
+          if (currentSessionId) {
+            headers['X-Session-Id'] = currentSessionId;
+          }
+          const response = await fetch(`/api/transcriptions/${currentJobId}`, { headers });
           if (!response.ok) {
             throw new Error('Failed to retrieve job status');
           }
@@ -472,9 +582,13 @@
       saveBtn.disabled = true;
       setStatus('Saving corrections…', 'info');
       try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (currentSessionId) {
+          headers['X-Session-Id'] = currentSessionId;
+        }
         const response = await fetch(`/api/transcriptions/${currentJobId}/finalise`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({ text: transcriptText.value }),
         });
         if (!response.ok) {
@@ -498,8 +612,27 @@
     });
 
     downloadBtn.addEventListener('click', () => {
-      if (!currentJobId) return;
-      window.open(`/api/transcriptions/${currentJobId}/download`, '_blank');
+      if (!currentJobId || !currentSessionId) return;
+      // Create a temporary link with session ID as query param for download
+      const url = `/api/transcriptions/${currentJobId}/download`;
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = '';
+      // Add session ID via fetch and blob for authenticated download
+      fetch(url, {
+        headers: { 'X-Session-Id': currentSessionId }
+      })
+      .then(response => response.blob())
+      .then(blob => {
+        const blobUrl = URL.createObjectURL(blob);
+        a.href = blobUrl;
+        a.click();
+        URL.revokeObjectURL(blobUrl);
+      })
+      .catch(error => {
+        console.error('Download failed:', error);
+        setStatus('Download failed', 'error');
+      });
     });
 
     newUploadBtn.addEventListener('click', () => {
@@ -510,7 +643,94 @@
       setStatus('', '');
       setPhase('idle');
       currentJobId = null;
+      clearSession();
     });
+
+    refreshBtn.addEventListener('click', async () => {
+      await checkServerStatus();
+    });
+
+    // Restore session on page load
+    async function restoreSession() {
+      const session = loadSession();
+      if (!session.jobId) {
+        // No saved job, check if server is busy
+        await checkServerStatus();
+        return;
+      }
+
+      currentSessionId = session.sessionId;
+
+      try {
+        const headers = {};
+        if (currentSessionId) {
+          headers['X-Session-Id'] = currentSessionId;
+        }
+        const response = await fetch(`/api/transcriptions/${session.jobId}`, { headers });
+        if (!response.ok) {
+          // Job not found or server error - clear invalid session
+          clearSession();
+          await checkServerStatus();
+          return;
+        }
+
+        const job = await response.json();
+        currentJobId = session.jobId;
+        outputPanel.classList.remove('hidden');
+        
+        applyJobUpdate(job);
+
+        if (job.status === 'completed') {
+          transcriptText.value = job.text || '';
+          transcriptText.disabled = false;
+          saveBtn.disabled = false;
+          downloadBtn.disabled = false;
+          setStatus('Welcome back! Your transcription is complete.', 'success');
+          setPhase('completed');
+        } else if (job.status === 'failed') {
+          transcriptText.disabled = true;
+          setStatus(`Transcription failed: ${job.error || 'Unknown error'}`, 'error');
+          setPhase('failed');
+        } else {
+          // Still processing or pending
+          transcriptText.disabled = true;
+          setStatus('Resuming your transcription session...', 'info');
+          startPolling();
+        }
+      } catch (error) {
+        console.error('Failed to restore session:', error);
+        clearSession();
+      }
+    }
+
+    // Initialize session restoration when page loads
+    (async function init() {
+      // First check if server is busy
+      const statusResponse = await fetch('/api/transcriptions/status').catch(() => null);
+      if (statusResponse?.ok) {
+        const statusData = await statusResponse.json();
+        
+        // Check if we have a saved session
+        const session = loadSession();
+        
+        if (statusData.busy && statusData.active_job) {
+          // Server is busy - check if it's our job
+          if (session.jobId && session.jobId === statusData.active_job.job_id) {
+            // It's our job, restore normally
+            await restoreSession();
+          } else {
+            // Different job is running, show busy screen
+            showServerBusy(statusData.active_job);
+          }
+        } else {
+          // Server not busy, restore session if any
+          await restoreSession();
+        }
+      } else {
+        // Fallback if status check fails
+        await restoreSession();
+      }
+    })();
   </script>
 </body>
 </html>

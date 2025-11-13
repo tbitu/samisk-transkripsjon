@@ -37,11 +37,12 @@ def _load_silero_vad_model() -> Tuple:
             onnx=False,
         )
         
-        # Move model to CPU to avoid device mismatch issues
-        # Silero VAD is lightweight enough to run well on CPU
-        model = model.cpu()
+        # Move model to GPU when available for better performance
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
         
-        logger.info("Silero VAD model loaded successfully (CPU)")
+        device_info = "GPU" if torch.cuda.is_available() else "CPU"
+        logger.info("Silero VAD model loaded successfully (%s)", device_info)
         return model, utils
     except Exception as exc:
         logger.error("Failed to load Silero VAD model: %s", exc)
@@ -77,6 +78,10 @@ def detect_speech_segments(
     try:
         # Load audio - Silero expects torch tensor at 16kHz
         wav = read_audio(str(audio_path), sampling_rate=sample_rate)
+        
+        # Ensure tensor is on same device as model to avoid device mismatch
+        device = next(model.parameters()).device
+        wav = wav.to(device)
         
         # Get speech timestamps (in samples)
         speech_timestamps = get_speech_timestamps(
@@ -190,8 +195,12 @@ def detect_speech_in_array(
             else:
                 audio_array = audio_array.astype(np.float32)
         
-        # Convert to torch tensor
+        # Convert to torch tensor and move to same device as model
         wav = torch.from_numpy(audio_array).float()
+        
+        # Move tensor to same device as model to avoid device mismatch
+        device = next(model.parameters()).device
+        wav = wav.to(device)
         
         # Resample if needed
         if sample_rate != 16000:
@@ -262,7 +271,16 @@ def refine_segment_with_vad(
         if len(data.shape) > 1:
             data = np.mean(data, axis=1)
         
-        # Extract the time range
+        # Resample to target sample rate if needed (VAD requires 16kHz)
+        if sr != sample_rate:
+            import torchaudio.functional as AF
+            import torch
+            data_tensor = torch.from_numpy(data).float()
+            data_tensor = AF.resample(data_tensor, sr, sample_rate)
+            data = data_tensor.numpy()
+            sr = sample_rate
+        
+        # Extract the time range (now at the correct sample rate)
         start_sample = int(start_ms * sr / 1000)
         end_sample = int(end_ms * sr / 1000)
         segment_data = data[start_sample:end_sample]
@@ -336,5 +354,43 @@ def refine_segment_with_vad_cached(
         return [(0, end_ms - start_ms)]
 
 
-# Import dataclass here to avoid circular import issues
-from dataclasses import dataclass
+def clear_vad_from_memory() -> None:
+    """Clear Silero VAD model from GPU memory to free up resources."""
+    import gc
+    import time
+    
+    try:
+        # CRITICAL: Get the cached model FIRST, move to CPU, THEN clear cache
+        # This prevents race conditions and ensures proper cleanup
+        try:
+            model, utils = _load_silero_vad_model()
+            
+            # Move model to CPU before clearing cache
+            if torch.cuda.is_available():
+                cpu_device = torch.device("cpu")
+                model.to(cpu_device)
+                
+                # Ensure GPU operations complete
+                torch.cuda.synchronize()
+                
+        except Exception as move_exc:
+            logger.debug("Could not move VAD model to CPU: %s", move_exc)
+        
+        # Now clear the cache
+        _load_silero_vad_model.cache_clear()
+        
+        # Force garbage collection multiple times to ensure cleanup
+        for _ in range(3):
+            gc.collect()
+        
+        # Clear CUDA cache and synchronize
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            # Add a small grace period for GPU driver to complete cleanup
+            time.sleep(0.2)
+            
+        logger.info("Silero VAD model cleared from GPU memory")
+    except Exception as exc:
+        logger.debug("Failed to clear VAD from memory: %s", exc)

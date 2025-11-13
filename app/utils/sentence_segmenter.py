@@ -8,29 +8,82 @@ import math
 import os
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import ffmpeg
 import numpy as np
 import soundfile as sf
 import torch
+import torchaudio.functional as AF
 
 from .audio_chunker import AudioChunk, chunk_audio_file
 
-logger = logging.getLogger(__name__)
-
 DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-3.1"
+# Batch sizes for parallel processing during diarization (GPU only)
+# Higher values use more GPU memory but process faster
+# Reduce if you encounter OOM errors
+DIARIZATION_SEGMENTATION_BATCH_SIZE = 32
+DIARIZATION_EMBEDDING_BATCH_SIZE = 32
 TARGET_SAMPLE_RATE = 16_000
 MAX_SENTENCE_DURATION_MS = 20_000
 MIN_SENTENCE_DURATION_MS = 1_200
+SEGMENT_PADDING_MS = 250  # Padding to prevent mid-word cuts for Whisper timestamp prediction
 QUESTION_PITCH_DELTA = 18.0
 QUESTION_MIN_FRAMES = 5
+
+_diarization_pipeline: Optional[Any] = None
+_diarization_pipeline_loading = False
+_diarization_lock = threading.Lock()
+
+logger = logging.getLogger(__name__)
+
+
+class ProgressAdapter:
+    """Translate pyannote's progress hooks into application-specific progress."""
+
+    def __init__(
+        self,
+        callback: Optional[Callable[[float, Optional[Dict[str, Any]]], None]] = None,
+    ):
+        self.callback = callback
+        # Model loading is fast, so we don't allocate progress time to it.
+        # Diarization inference is all that counts.
+        self.model_load_fraction = 0.0
+        self.inference_fraction = 1.0
+        self.chunking_total = 0
+
+    def emit_diarization(self, value: float, meta: Optional[Dict[str, Any]] = None) -> None:
+        """Emit progress for the diarization stage."""
+        if not self.callback:
+            return
+
+        # Model loading doesn't emit progress, so we only handle diarization inference here
+        details = {"phase": "diarization", "diarization_fraction": value}
+        details.update(meta or {})
+        self.callback(value, details)
+
+    def emit_chunking_reset(self, total: int) -> None:
+        """Initialize chunking progress tracking."""
+        self.chunking_total = total
+        if self.callback:
+            details = {"phase": "chunking", "total": total, "completed": 0}
+            self.callback(0.0, details)
+
+    def emit_chunking_progress(self, completed: int) -> None:
+        """Emit progress for audio chunking."""
+        if not self.callback or self.chunking_total == 0:
+            return
+        
+        fraction = completed / self.chunking_total
+        details = {"phase": "chunking", "total": self.chunking_total, "completed": completed}
+        self.callback(fraction, details)
 
 
 @dataclass(frozen=True)
@@ -49,34 +102,66 @@ class SentenceChunk:
 
 
 def prepare_sentence_chunks(
-    source: Path,
+    audio_file: Path,
     output_dir: Path,
-    *,
-    progress: Optional[Callable[[float, Optional[Dict[str, object]]], None]] = None,
+    progress: Optional[Callable[[float, Optional[Dict[str, Any]]], None]] = None,
 ) -> List[SentenceChunk]:
-    """Extract sentence-sized chunks with speaker labels when available."""
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    progress_adapter = _ProgressAdapter(progress) if progress else None
-
-    if progress_adapter:
-        progress_adapter.emit_start()
+    """
+    Run diarization and VAD to prepare sentence-level audio chunks.
+    
+    Args:
+        audio_file: Path to the input audio file.
+        output_dir: Directory to store temporary chunk files.
+        progress: Optional callback for progress updates.
+        
+    Returns:
+        A list of SentenceChunk objects.
+    """
+    if not progress:
+        progress_adapter = None
+    else:
+        progress_adapter = ProgressAdapter(progress)
 
     # Diarization is mandatory: always attempt diarization and fail loudly
     try:
         diarization = _run_diarization(
-            source,
+            audio_file,
             progress=progress_adapter.emit_diarization if progress_adapter else None,
         )
-    except Exception as exc:  # pragma: no cover - external failures should surface
+    except Exception as exc:
         logger.error("Speaker diarization failed: %s", exc)
-        raise
+        raise RuntimeError("Diarization failed") from exc
 
-    segments_to_extract = _collect_sentence_segments(source, diarization)
+    # Log GPU memory before diarization cleanup
+    if torch.cuda.is_available():
+        try:
+            allocated_before = torch.cuda.memory_allocated(0) / 1024**3
+            reserved_before = torch.cuda.memory_reserved(0) / 1024**3
+            free_before = torch.cuda.mem_get_info(0)[0] / 1024**3
+            logger.info(f"GPU before diarization cleanup - Allocated: {allocated_before:.2f}GB, Reserved: {reserved_before:.2f}GB, Free: {free_before:.2f}GB")
+        except Exception:
+            pass
+
+    # CRITICAL: Unload diarization from GPU before loading VAD
+    _offload_diarization_pipeline()
+
+    # Log GPU memory after diarization cleanup
+    if torch.cuda.is_available():
+        try:
+            allocated_after = torch.cuda.memory_allocated(0) / 1024**3
+            reserved_after = torch.cuda.memory_reserved(0) / 1024**3
+            free_after = torch.cuda.mem_get_info(0)[0] / 1024**3
+            freed = free_after - free_before
+            logger.info(f"GPU after diarization cleanup - Allocated: {allocated_after:.2f}GB, Reserved: {reserved_after:.2f}GB, Free: {free_after:.2f}GB (freed {freed:.2f}GB)")
+        except Exception:
+            pass
+
+    logger.info("Diarization complete, GPU memory freed for VAD")
+
+    segments_to_extract = _collect_sentence_segments(audio_file, diarization)
 
     if not segments_to_extract:
-        logger.error("Diarization completed but produced no chunks for %s", source)
+        logger.error("Diarization completed but produced no chunks for %s", audio_file)
         raise RuntimeError("Diarization produced no chunks")
 
     chunks: List[Optional[SentenceChunk]] = [None] * len(segments_to_extract)
@@ -93,7 +178,7 @@ def prepare_sentence_chunks(
     if worker_count <= 1:
         for index, (start_ms, end_ms, speaker) in enumerate(segments_to_extract):
             chunk_index, chunk = _build_sentence_chunk(
-                source,
+                audio_file,
                 output_dir,
                 index,
                 start_ms,
@@ -111,7 +196,7 @@ def prepare_sentence_chunks(
             futures = [
                 executor.submit(
                     _build_sentence_chunk,
-                    source,
+                    audio_file,
                     output_dir,
                     index,
                     start_ms,
@@ -131,92 +216,36 @@ def prepare_sentence_chunks(
                         progress_adapter.emit_chunking_progress(completed)
 
     prepared_chunks = [chunk for chunk in chunks if chunk is not None]
-    _offload_diarization_pipeline()
-    return prepared_chunks
-
-
-class _ProgressAdapter:
-    """Normalize diarization + chunking progress into a single monotonic track."""
-
-    _DIARIZATION_WEIGHT = 0.7
-    _CHUNKING_WEIGHT = 1.0 - _DIARIZATION_WEIGHT
-
-    def __init__(
-        self,
-        callback: Callable[[float, Optional[Dict[str, object]]], None],
-    ) -> None:
-        self._callback = callback
-        self._lock = threading.Lock()
-        self._diarization_fraction = 0.0
-        self._chunking_fraction = 0.0
-        self._total_chunks = 0
-        self._last_combined = 0.0
-
-    def emit_start(self) -> None:
-        self._safe_emit(0.0, {"phase": "diarization", "stage": "start"})
-
-    def emit_diarization(
-        self,
-        fraction: float,
-        meta: Optional[Dict[str, object]] = None,
-    ) -> None:
-        bounded = self._bound(fraction)
-        with self._lock:
-            self._diarization_fraction = max(self._diarization_fraction, bounded)
-            combined = self._combined_progress()
-        payload = dict(meta or {})
-        payload.setdefault("phase", "pyannote")
-        self._safe_emit(combined, payload)
-
-    def emit_chunking_reset(self, total_chunks: int) -> None:
-        with self._lock:
-            self._total_chunks = max(0, total_chunks)
-            self._chunking_fraction = 0.0
-
-    def emit_chunking_progress(self, completed: int) -> None:
-        with self._lock:
-            if self._total_chunks <= 0:
-                fraction = 1.0
-            else:
-                fraction = self._bound(completed / self._total_chunks)
-            self._chunking_fraction = max(self._chunking_fraction, fraction)
-            combined = self._combined_progress()
-        payload: Dict[str, object] = {
-            "phase": "chunking",
-            "completed": completed,
-            "total": self._total_chunks,
-        }
-        self._safe_emit(combined, payload)
-
-    def _combined_progress(self) -> float:
-        combined = (
-            self._diarization_fraction * self._DIARIZATION_WEIGHT
-            + self._chunking_fraction * self._CHUNKING_WEIGHT
-        )
-        if combined < self._last_combined:
-            combined = self._last_combined
-        self._last_combined = min(1.0, combined)
-        return self._last_combined
-
-    def _safe_emit(
-        self,
-        fraction: float,
-        meta: Optional[Dict[str, object]] = None,
-    ) -> None:
-        if not self._callback:
-            return
-        bounded = self._bound(fraction)
-        payload = meta or {}
+    
+    # Log GPU memory before VAD cleanup
+    if torch.cuda.is_available():
         try:
-            self._callback(bounded, payload)
-        except Exception:  # pragma: no cover - defensive best effort
-            logger.debug("Progress callback failed", exc_info=True)
-
-    @staticmethod
-    def _bound(value: float) -> float:
-        if not isinstance(value, (float, int)):
-            return 0.0
-        return max(0.0, min(1.0, float(value)))
+            allocated_before = torch.cuda.memory_allocated(0) / 1024**3
+            reserved_before = torch.cuda.memory_reserved(0) / 1024**3
+            free_before = torch.cuda.mem_get_info(0)[0] / 1024**3
+            logger.info(f"GPU before VAD cleanup - Allocated: {allocated_before:.2f}GB, Reserved: {reserved_before:.2f}GB, Free: {free_before:.2f}GB")
+        except Exception:
+            pass
+    
+    # CRITICAL: Clear VAD from GPU now that sentence segmentation is complete
+    # This frees GPU memory for Stanza (punctuation)
+    from .vad import clear_vad_from_memory
+    clear_vad_from_memory()
+    
+    # Log GPU memory after VAD cleanup
+    if torch.cuda.is_available():
+        try:
+            allocated_after = torch.cuda.memory_allocated(0) / 1024**3
+            reserved_after = torch.cuda.memory_reserved(0) / 1024**3
+            free_after = torch.cuda.mem_get_info(0)[0] / 1024**3
+            freed = free_after - free_before
+            logger.info(f"GPU after VAD cleanup - Allocated: {allocated_after:.2f}GB, Reserved: {reserved_after:.2f}GB, Free: {free_after:.2f}GB (freed {freed:.2f}GB)")
+        except Exception:
+            pass
+    
+    logger.info("VAD processing complete, GPU memory freed for punctuation")
+    
+    return prepared_chunks
 
 
 def _has_hf_token() -> bool:
@@ -232,47 +261,138 @@ def _has_hf_token() -> bool:
     return token_file.exists() and token_file.read_text().strip() != ""
 
 
-def _run_diarization(source: Path, progress: Optional[Callable[[float, Optional[Dict[str, object]]], None]] = None):
-    pipeline = _load_diarization_pipeline()
-    _ensure_diarization_device(pipeline)
+def _run_diarization(
+    audio_file: Path,
+    progress: Optional[Callable[[float, Optional[Dict[str, Any]]], None]] = None,
+) -> Any:
+    """Run speaker diarization on the given audio file."""
+    pipeline = _load_diarization_pipeline(progress=progress)
 
-    with _prepare_diarization_source(source) as normalized_source:
-        if not progress:
-            return pipeline(str(normalized_source))
+    logger.info("Running speaker diarization on %s", audio_file)
+    
+    # Wrap the pipeline's progress hook
+    if progress:
+        from pyannote.audio.pipelines.utils.hook import ProgressHook
+        
+        # Create a custom hook to track progress (without console output)
+        class TrackingHook(ProgressHook):
+            def __init__(self, progress_callback):
+                super().__init__()
+                self.progress_callback = progress_callback
+                
+            def __call__(self, step_name, step_artifact, file=None, total=None, completed=None):
+                # ONLY report progress for the embeddings step - that's the actual diarization work
+                # Ignore segmentation and speaker_counting as they're preprocessing
+                if step_name == 'embeddings' and completed is not None and total is not None and total > 0:
+                    # Report embeddings progress directly as overall diarization progress
+                    progress = completed / total
+                    self.progress_callback(progress, {"phase": "diarization", "step": "embeddings"})
+        
+        with TrackingHook(progress) as hook:
+            diarization = pipeline(str(audio_file), hook=hook)
+            progress(1.0, {"phase": "diarization"})
+    else:
+        diarization = pipeline(str(audio_file))
 
-        class _HookAdapter:
-            def __enter__(self):
-                return self
+    logger.info("Diarization complete")
+    return diarization
 
-            def __exit__(self, *args):
-                return False
 
-            def __call__(
-                self,
-                step_name: str,
-                step_artifact,
-                file: Optional[Mapping] = None,
-                total: Optional[int] = None,
-                completed: Optional[int] = None,
-            ) -> None:
-                try:
-                    if total and completed is not None and total > 0:
-                        fraction = float(completed) / float(total)
-                    elif completed is not None:
-                        fraction = 1.0 if completed > 0 else 0.0
-                    else:
-                        fraction = 0.0
+def _load_diarization_pipeline(
+    progress: Optional[Callable[[float, Optional[Dict[str, Any]]], None]] = None,
+) -> Any:
+    """Load the pyannote diarization pipeline with progress."""
+    global _diarization_pipeline, _diarization_pipeline_loading
+    with _diarization_lock:
+        if _diarization_pipeline:
+            # Model is already loaded, return immediately without progress updates
+            # Model loading should not count towards progress at all
+            return _diarization_pipeline
+        if _diarization_pipeline_loading:
+            # Another thread is loading, wait and check again
+            while _diarization_pipeline_loading:
+                time.sleep(0.5)
+            if _diarization_pipeline:
+                return _diarization_pipeline
 
-                    meta: Dict[str, object] = {
-                        "stage": step_name,
-                        "completed": completed,
-                        "total": total,
-                    }
-                    progress(fraction, meta)
-                except Exception:
-                    logger.debug("Hook adapter failed to emit progress", exc_info=True)
+        _diarization_pipeline_loading = True
 
-        return pipeline(str(normalized_source), hook=_HookAdapter())
+    try:
+        logger.info("Loading diarization pipeline: %s", DIARIZATION_MODEL_ID)
+
+        hf_token = _get_hf_token()
+        if not hf_token:
+            raise RuntimeError("Hugging Face token not found for diarization")
+
+        from pyannote.audio import Pipeline
+        pipeline = Pipeline.from_pretrained(
+            DIARIZATION_MODEL_ID,
+            token=hf_token,
+        )
+
+        if torch.cuda.is_available():
+            logger.info("Moving diarization pipeline to GPU")
+            pipeline = pipeline.to(torch.device("cuda"))
+            
+            # Enable batch processing for faster diarization on GPU
+            # Segmentation processes audio chunks in parallel
+            # Default is 1 which only uses one core - increase for better GPU utilization
+            pipeline.segmentation_batch_size = DIARIZATION_SEGMENTATION_BATCH_SIZE
+            pipeline.embedding_batch_size = DIARIZATION_EMBEDDING_BATCH_SIZE
+            logger.info(
+                f"Configured diarization with segmentation_batch_size={DIARIZATION_SEGMENTATION_BATCH_SIZE}, "
+                f"embedding_batch_size={DIARIZATION_EMBEDDING_BATCH_SIZE} for parallel processing"
+            )
+
+        with _diarization_lock:
+            _diarization_pipeline = pipeline
+            return _diarization_pipeline
+    finally:
+        with _diarization_lock:
+            _diarization_pipeline_loading = False
+
+
+def _offload_diarization_pipeline() -> None:
+    """Move the diarization pipeline to CPU and clear GPU cache."""
+    global _diarization_pipeline
+    with _diarization_lock:
+        if not _diarization_pipeline:
+            return
+
+        logger.info("Offloading diarization pipeline from GPU to CPU")
+        try:
+            _diarization_pipeline = _diarization_pipeline.to(torch.device("cpu"))
+        except Exception as exc:
+            logger.warning("Could not move diarization pipeline to CPU: %s", exc)
+        
+        _diarization_pipeline = None
+
+        # Force garbage collection and clear cache
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+
+def _get_hf_token() -> Optional[str]:
+    """Retrieve the Hugging Face token from the environment or a file."""
+    import os
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        return token
+    
+    # Check for a file named 'hf_token' in the root directory
+    try:
+        from .. import main
+        root_dir = Path(main.__file__).parent.parent
+        token_file = root_dir / "hf_token"
+        if token_file.exists():
+            return token_file.read_text().strip()
+    except Exception:
+        pass
+        
+    return None
 
 
 def _iter_diarization_turns(diarization) -> Iterable[tuple[float, float, str]]:
@@ -306,200 +426,13 @@ def _iter_diarization_turns(diarization) -> Iterable[tuple[float, float, str]]:
                 yield s, e, sp
             return
 
-    # A DiarizeOutput may expose .annotated or .labels; try common attributes
-    for attr in ("annotated", "segments", "labels", "labels_"):
-        if hasattr(diarization, attr):
-            container = getattr(diarization, attr)
-            try:
-                for item in container:
-                    # item may be (segment, label) or dict-like
-                    if isinstance(item, tuple) and len(item) >= 2:
-                        seg, label = item[0], item[-1]
-                        s = float(getattr(seg, "start", seg.get("start", 0.0)))
-                        e = float(getattr(seg, "end", seg.get("end", 0.0)))
-                        yield s, e, label
-                    elif isinstance(item, dict):
-                        s = float(item.get("start", 0.0))
-                        e = float(item.get("end", 0.0))
-                        sp = item.get("speaker") or item.get("label") or "unknown"
-                        yield s, e, sp
-            except Exception:
-                # Fallthrough to last-ditch attempt below
-                pass
-
-    # If nothing matched, raise a helpful error so caller can fallback
-    raise RuntimeError("Unsupported diarization output format: %r" % (type(diarization),))
-
-
-@lru_cache(maxsize=1)
-def _load_diarization_pipeline():  # pragma: no cover - external model loading
-    try:
-        from pyannote.audio import Pipeline
-    except Exception as exc:  # ImportError or other runtime issues
-        raise RuntimeError("pyannote.audio is required for speaker diarization") from exc
-
-    token = (
-        os.environ.get("PYANNOTE_AUTH_TOKEN")
-        or os.environ.get("HUGGINGFACE_TOKEN")
-        or os.environ.get("HF_TOKEN")
-    )
-    if not token:
-        # fall back to a repository-local token file if present (hf_token)
-        token_file = Path(__file__).resolve().parents[2] / "hf_token"
-        if token_file.exists():
-            token = token_file.read_text().strip()
-
-    if not token:
-        raise RuntimeError(
-            "Missing authentication token for pyannote.audio. Set PYANNOTE_AUTH_TOKEN or place token in ./hf_token."
-        )
-
-    # Instead of guessing keyword names, register the token with the
-    # Hugging Face hub client which lets Pipeline.from_pretrained() use the
-    # authenticated session regardless of the function signature. This
-    # avoids mismatch issues between `token` and `use_auth_token` kwargs.
-    if token:
-        try:
-            # Import locally to keep the dependency optional for users who
-            # won't use diarization.
-            from huggingface_hub import login as _hf_login
-
-            _hf_login(token)
-        except Exception:
-            # If global login fails, proceed and let the subsequent download
-            # raise a clear error that will be handled by the caller.
-            logger.debug("Failed to register HF token via huggingface_hub.login")
-
-    # Now call Pipeline.from_pretrained without passing auth kwargs so we
-    # avoid signature mismatches in different pyannote versions.
-    pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL_ID)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pipeline.to(device)
-    _configure_diarization_inference(pipeline)
-    return pipeline
-
-
-@contextmanager
-def _prepare_diarization_source(source: Path) -> Iterable[Path]:
-    """Yield a path to 16 kHz mono PCM audio suitable for pyannote."""
-
-    try:
-        info = sf.info(str(source))
-    except Exception:
-        info = None
-
-    if (
-        info
-        and info.samplerate == TARGET_SAMPLE_RATE
-        and getattr(info, "channels", 0) == 1
-    ):
-        # Already in the desired shape.
-        yield source
-        return
-
-    tmpdir = TemporaryDirectory(prefix="pyannote_norm_")
-    try:
-        target = Path(tmpdir.name) / "normalized.wav"
-        process = (
-            ffmpeg.input(str(source))
-            .output(
-                str(target),
-                format="wav",
-                ac=1,
-                ar=TARGET_SAMPLE_RATE,
-                sample_fmt="s16",
-            )
-            .overwrite_output()
-            .global_args("-loglevel", "error")
-        )
-
-        try:
-            process.run(capture_stdout=True, capture_stderr=True)
-        except ffmpeg.Error as exc:
-            stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else str(exc)
-            raise RuntimeError(f"Failed to normalise audio for diarization: {stderr}") from exc
-
-        yield target
-    finally:
-        tmpdir.cleanup()
-
-
-def _configure_diarization_inference(pipeline) -> None:
-    """Increase inference parallelism and batch duration when possible."""
-
-    target_workers = max(1, (os.cpu_count() or 1) // 2)
-    target_batch_size = 32
-    target_duration = 15.0
-
-    def _tune(obj) -> None:
-        if obj is None:
+        # Some pyannote versions return {'annotated': Annotation_obj}
+        if "annotated" in diarization:
+            for turn, _, speaker in diarization["annotated"].itertracks(yield_label=True):
+                yield float(turn.start), float(turn.end), speaker
             return
-        try:
-            if hasattr(obj, "num_workers"):
-                current = getattr(obj, "num_workers", 0) or 0
-                if current < target_workers:
-                    obj.num_workers = target_workers
-            if hasattr(obj, "batch_size"):
-                current = getattr(obj, "batch_size", None)
-                if current is None or current < target_batch_size:
-                    obj.batch_size = target_batch_size
-            if hasattr(obj, "duration"):
-                current = getattr(obj, "duration", None)
-                if current is None or current < target_duration:
-                    obj.duration = target_duration
-        except Exception:
-            logger.debug("Failed tuning diarization inference %r", obj, exc_info=True)
 
-    # Known attribute layouts in pyannote 3.x pipelines.
-    candidates = [
-        getattr(pipeline, name, None)
-        for name in (
-            "segmentation",
-            "speech_turn_segmentation",
-            "speaker_segmentation",
-            "_segmentation_inference",
-            "_speech_turn_segmentation_inference",
-        )
-    ]
-
-    for item in candidates:
-        if item is None:
-            continue
-        if hasattr(item, "inference"):
-            _tune(getattr(item, "inference"))
-        elif hasattr(item, "_inference"):
-            _tune(getattr(item, "_inference"))
-        else:
-            _tune(item)
-
-    inference_map = getattr(pipeline, "_inference", None)
-    if isinstance(inference_map, dict):
-        for inference in inference_map.values():
-            _tune(inference)
-
-
-def _ensure_diarization_device(pipeline) -> None:
-    if not torch.cuda.is_available():
-        return
-    try:
-        pipeline.to("cuda")
-    except Exception:
-        logger.debug("Failed moving diarization pipeline to CUDA", exc_info=True)
-
-
-def _offload_diarization_pipeline() -> None:
-    if not torch.cuda.is_available():
-        return
-    try:
-        pipeline = _load_diarization_pipeline()
-    except Exception:
-        return
-
-    try:
-        pipeline.to("cpu")
-        torch.cuda.empty_cache()
-    except Exception:
-        logger.debug("Failed offloading diarization pipeline to CPU", exc_info=True)
+    raise TypeError(f"Unsupported diarization type: {type(diarization)}")
 
 
 def _collect_sentence_segments(
@@ -523,10 +456,23 @@ def _collect_sentence_segments(
 
     # OPTIMIZATION: Load audio once instead of for every turn
     try:
-        audio_data, sample_rate = sf.read(str(source))
+        audio_data, original_sample_rate = sf.read(str(source))
         # Convert to mono if stereo
         if len(audio_data.shape) > 1:
             audio_data = np.mean(audio_data, axis=1)
+        
+        # CRITICAL: Resample to 16kHz immediately for VAD compatibility
+        # Silero VAD only supports 8kHz and 16kHz (or multiples of 16kHz)
+        if original_sample_rate != TARGET_SAMPLE_RATE:
+            logger.info("Resampling audio from %dHz to %dHz for VAD", original_sample_rate, TARGET_SAMPLE_RATE)
+            # Convert to torch tensor for resampling
+            audio_tensor = torch.from_numpy(audio_data).float()
+            # Resample using torchaudio
+            audio_tensor = AF.resample(audio_tensor, original_sample_rate, TARGET_SAMPLE_RATE)
+            # Convert back to numpy
+            audio_data = audio_tensor.numpy()
+        
+        sample_rate = TARGET_SAMPLE_RATE
         logger.info("Loaded audio for VAD refinement: %d samples at %dHz", len(audio_data), sample_rate)
     except Exception as exc:
         logger.warning("Failed to pre-load audio for VAD: %s. Falling back to simple segmentation.", exc)
@@ -725,8 +671,17 @@ def _clamp(*, s: int, e: int, limit: int) -> tuple[int, int]:
 
 
 def _extract_segment(source: Path, start_ms: int, end_ms: int, target: Path) -> None:
-    start_s = max(0.0, start_ms / 1000.0)
-    duration_s = max(0.05, (end_ms - start_ms) / 1000.0)
+    # Add padding to prevent mid-word cuts that cause Whisper timestamp failures
+    padded_start_ms = max(0, start_ms - SEGMENT_PADDING_MS)
+    padded_end_ms = end_ms + SEGMENT_PADDING_MS  # ffmpeg handles if this exceeds file length
+    
+    start_s = padded_start_ms / 1000.0
+    duration_s = max(0.05, (padded_end_ms - padded_start_ms) / 1000.0)
+    
+    logger.debug(
+        "Extracting segment %d-%dms (padded to %d-%dms, +%dms padding)",
+        start_ms, end_ms, padded_start_ms, padded_end_ms, SEGMENT_PADDING_MS
+    )
 
     process = (
         ffmpeg.input(str(source), ss=start_s, t=duration_s)

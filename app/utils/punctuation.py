@@ -53,15 +53,21 @@ def _load_stanza_pipeline(lang: str = "nb"):
     try:
         # Initialize pipeline with tokenization, POS tagging, and dependency parsing
         # These features help with punctuation placement
+        # Use GPU when available for faster processing
+        import torch
+        use_gpu = torch.cuda.is_available()
+        
         nlp = stanza.Pipeline(
             lang=lang,
             processors='tokenize,pos,lemma',
             tokenize_no_ssplit=False,  # Allow sentence splitting
             verbose=False,
             download_method=None,  # Don't auto-download during initialization
+            use_gpu=use_gpu,  # Use GPU when available (will be unloaded after use)
         )
         
-        logger.info("Stanza pipeline loaded for language: %s", lang)
+        device_info = "GPU" if use_gpu else "CPU"
+        logger.info("Stanza pipeline loaded for language: %s (using %s)", lang, device_info)
         return nlp
         
     except Exception as exc:
@@ -318,3 +324,55 @@ def split_into_sentences(text: str, lang: str = "nb") -> List[str]:
         logger.warning("Stanza sentence splitting failed: %s", exc)
         # Simple fallback
         return [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+
+
+def clear_stanza_from_memory() -> None:
+    """Clear Stanza models from GPU memory to free up resources."""
+    import gc
+    import torch
+    import time
+    
+    try:
+        # CRITICAL: Get the cached pipeline FIRST, move to CPU, THEN clear cache
+        # This prevents race conditions and ensures proper cleanup
+        try:
+            nlp = _load_stanza_pipeline("nb")  # Load the cached pipeline
+            
+            # Move Stanza models to CPU before clearing cache
+            if torch.cuda.is_available() and hasattr(nlp, 'processors'):
+                cpu_device = torch.device("cpu")
+                
+                # Move all processor models to CPU
+                for processor_name, processor in nlp.processors.items():
+                    try:
+                        if hasattr(processor, 'model') and hasattr(processor.model, 'to'):
+                            processor.model.to(cpu_device)
+                        if hasattr(processor, 'to'):
+                            processor.to(cpu_device)
+                    except Exception as proc_exc:
+                        logger.debug("Could not move %s processor to CPU: %s", processor_name, proc_exc)
+                
+                # Ensure GPU operations complete
+                torch.cuda.synchronize()
+                
+        except Exception as move_exc:
+            logger.debug("Could not move Stanza pipeline to CPU: %s", move_exc)
+        
+        # Clear the lru_cache for the stanza pipeline
+        _load_stanza_pipeline.cache_clear()
+        
+        # Force garbage collection multiple times to ensure cleanup
+        for _ in range(3):
+            gc.collect()
+        
+        # Clear CUDA cache and synchronize
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            # Add a small grace period for GPU driver to complete cleanup
+            time.sleep(0.2)
+            
+        logger.info("Stanza models cleared from GPU memory")
+    except Exception as exc:
+        logger.debug("Failed to clear Stanza from memory: %s", exc)

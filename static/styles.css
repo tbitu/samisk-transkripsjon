@@ -406,3 +406,56 @@ textarea:disabled {
     justify-content: center;
   }
 }
+
+/* Server Busy Panel */
+.panel-busy {
+  grid-column: 1 / -1;
+  max-width: 600px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.busy-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 1.5rem;
+}
+
+.busy-icon {
+  width: 64px;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--primary-soft);
+  border-radius: 50%;
+  color: var(--primary);
+}
+
+.busy-content h2 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.busy-content p {
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.busy-content .progress-block {
+  width: 100%;
+  margin-top: 0.5rem;
+}
+
+.busy-time-estimate {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+#refresh-btn {
+  margin-top: 0.5rem;
+}

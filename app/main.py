@@ -1,6 +1,7 @@
 """Application entrypoint for the Samisk transcription service."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,6 +13,13 @@ from .routes.transcription import router as transcription_router
 from pathlib import Path
 import os
 from fastapi import HTTPException
+
+# Configure logging for the entire application
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 app = FastAPI(
     title="Samisk Transkribering",
