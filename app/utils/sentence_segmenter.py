@@ -506,8 +506,32 @@ def _collect_sentence_segments(
     source: Path,
     diarization,
 ) -> List[tuple[int, int, Optional[str]]]:
+    """
+    Collect sentence segments from diarization, refined with Silero VAD.
+    
+    This function:
+    1. Loads the full audio once (optimization!)
+    2. Extracts speaker turns from diarization
+    3. Runs Silero VAD on each turn to find actual speech
+    4. Merges short adjacent segments within the same speaker turn
+    5. Enforces MIN/MAX_SENTENCE_DURATION_MS constraints
+    """
+    from .vad import detect_speech_segments, merge_adjacent_segments, SpeechSegment
+    
     total_duration_ms = int(round(_probe_duration_ms(source)))
     segments: List[tuple[int, int, Optional[str]]] = []
+
+    # OPTIMIZATION: Load audio once instead of for every turn
+    try:
+        audio_data, sample_rate = sf.read(str(source))
+        # Convert to mono if stereo
+        if len(audio_data.shape) > 1:
+            audio_data = np.mean(audio_data, axis=1)
+        logger.info("Loaded audio for VAD refinement: %d samples at %dHz", len(audio_data), sample_rate)
+    except Exception as exc:
+        logger.warning("Failed to pre-load audio for VAD: %s. Falling back to simple segmentation.", exc)
+        audio_data = None
+        sample_rate = TARGET_SAMPLE_RATE
 
     for start_s, end_s, speaker in _iter_diarization_turns(diarization):
         start_ms = int(round(max(0.0, start_s) * 1000))
@@ -516,14 +540,168 @@ def _collect_sentence_segments(
         if end_ms - start_ms < MIN_SENTENCE_DURATION_MS:
             continue
 
+        # Refine this speaker turn with VAD
+        if audio_data is not None:
+            try:
+                vad_segments = _refine_turn_with_vad_cached(
+                    audio_data,
+                    sample_rate,
+                    start_ms, 
+                    end_ms,
+                    speaker,
+                    total_duration_ms,
+                )
+                segments.extend(vad_segments)
+                continue
+            except Exception as exc:
+                logger.warning("VAD refinement failed for turn at %d-%d: %s", start_ms, end_ms, exc)
+        
+        # Fallback to simple segmentation
         for sub_start, sub_end in _segment_turn(start_ms, end_ms):
             safe_start, safe_end = _clamp(s=sub_start, e=sub_end, limit=total_duration_ms)
-            if safe_end - safe_start < MIN_SENTENCE_DURATION_MS:
-                continue
-
-            segments.append((safe_start, safe_end, speaker))
+            if safe_end - safe_start >= MIN_SENTENCE_DURATION_MS:
+                segments.append((safe_start, safe_end, speaker))
 
     return segments
+
+
+def _refine_turn_with_vad_cached(
+    audio_data: np.ndarray,
+    sample_rate: int,
+    turn_start_ms: int,
+    turn_end_ms: int,
+    speaker: Optional[str],
+    total_duration_ms: int,
+) -> List[tuple[int, int, Optional[str]]]:
+    """
+    Use Silero VAD to refine a speaker turn into precise speech segments (optimized).
+    
+    This version uses pre-loaded audio data for better performance.
+    
+    Returns list of (start_ms, end_ms, speaker) tuples.
+    """
+    from .vad import refine_segment_with_vad_cached, SpeechSegment, merge_adjacent_segments
+    
+    # Get VAD segments relative to the turn
+    relative_segments = refine_segment_with_vad_cached(
+        audio_data,
+        sample_rate,
+        turn_start_ms,
+        turn_end_ms,
+        min_speech_duration_ms=MIN_SENTENCE_DURATION_MS // 2,  # Be more lenient initially
+        min_silence_duration_ms=100,
+    )
+    
+    if not relative_segments:
+        # No speech detected, return empty
+        return []
+    
+    # Convert relative offsets to absolute timestamps
+    absolute_segments = []
+    for rel_start, rel_end in relative_segments:
+        abs_start = turn_start_ms + rel_start
+        abs_end = turn_start_ms + rel_end
+        absolute_segments.append(SpeechSegment(start_ms=abs_start, end_ms=abs_end))
+    
+    # Merge adjacent segments that are close together
+    merged_segments = merge_adjacent_segments(
+        absolute_segments,
+        max_gap_ms=300,  # Merge if gap is less than 300ms
+        max_duration_ms=MAX_SENTENCE_DURATION_MS,
+    )
+    
+    # Convert to final format, enforcing duration constraints
+    result = []
+    for seg in merged_segments:
+        # Clamp to valid range
+        start_ms = max(0, min(seg.start_ms, total_duration_ms))
+        end_ms = max(start_ms, min(seg.end_ms, total_duration_ms))
+        
+        duration = end_ms - start_ms
+        
+        # Skip segments that are too short
+        if duration < MIN_SENTENCE_DURATION_MS:
+            continue
+        
+        # Split segments that are too long
+        if duration > MAX_SENTENCE_DURATION_MS:
+            for sub_start, sub_end in _segment_turn(start_ms, end_ms):
+                safe_start, safe_end = _clamp(s=sub_start, e=sub_end, limit=total_duration_ms)
+                if safe_end - safe_start >= MIN_SENTENCE_DURATION_MS:
+                    result.append((safe_start, safe_end, speaker))
+        else:
+            result.append((start_ms, end_ms, speaker))
+    
+    return result
+
+
+def _refine_turn_with_vad(
+    source: Path,
+    turn_start_ms: int,
+    turn_end_ms: int,
+    speaker: Optional[str],
+    total_duration_ms: int,
+) -> List[tuple[int, int, Optional[str]]]:
+    """
+    Use Silero VAD to refine a speaker turn into precise speech segments.
+    
+    DEPRECATED: Use _refine_turn_with_vad_cached for better performance.
+    
+    Returns list of (start_ms, end_ms, speaker) tuples.
+    """
+    from .vad import refine_segment_with_vad, SpeechSegment, merge_adjacent_segments
+    
+    # Get VAD segments relative to the turn
+    relative_segments = refine_segment_with_vad(
+        source,
+        turn_start_ms,
+        turn_end_ms,
+        min_speech_duration_ms=MIN_SENTENCE_DURATION_MS // 2,  # Be more lenient initially
+        min_silence_duration_ms=100,
+        sample_rate=TARGET_SAMPLE_RATE,
+    )
+    
+    if not relative_segments:
+        # No speech detected, return empty
+        return []
+    
+    # Convert relative offsets to absolute timestamps
+    absolute_segments = []
+    for rel_start, rel_end in relative_segments:
+        abs_start = turn_start_ms + rel_start
+        abs_end = turn_start_ms + rel_end
+        absolute_segments.append(SpeechSegment(start_ms=abs_start, end_ms=abs_end))
+    
+    # Merge adjacent segments that are close together
+    merged_segments = merge_adjacent_segments(
+        absolute_segments,
+        max_gap_ms=300,  # Merge if gap is less than 300ms
+        max_duration_ms=MAX_SENTENCE_DURATION_MS,
+    )
+    
+    # Convert to final format, enforcing duration constraints
+    result = []
+    for seg in merged_segments:
+        # Clamp to valid range
+        start_ms = max(0, min(seg.start_ms, total_duration_ms))
+        end_ms = max(start_ms, min(seg.end_ms, total_duration_ms))
+        
+        duration = end_ms - start_ms
+        
+        # Skip segments that are too short
+        if duration < MIN_SENTENCE_DURATION_MS:
+            continue
+        
+        # Split segments that are too long
+        if duration > MAX_SENTENCE_DURATION_MS:
+            for sub_start, sub_end in _segment_turn(start_ms, end_ms):
+                safe_start, safe_end = _clamp(s=sub_start, e=sub_end, limit=total_duration_ms)
+                if safe_end - safe_start >= MIN_SENTENCE_DURATION_MS:
+                    result.append((safe_start, safe_end, speaker))
+        else:
+            result.append((start_ms, end_ms, speaker))
+    
+    return result
 
 
 def _segment_turn(start_ms: int, end_ms: int) -> Iterable[tuple[int, int]]:

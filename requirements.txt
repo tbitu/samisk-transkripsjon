@@ -11,6 +11,7 @@ soundfile>=0.12
 pyannote.audio>=3.1
 librosa>=0.10
 fpdf2>=2.7
+stanza>=1.8.0
 
 # PyTorch and torchaudio are installed separately because CUDA builds
 # are platform/driver-specific. Use one of the commands below depending

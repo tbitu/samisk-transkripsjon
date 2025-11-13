@@ -83,6 +83,113 @@ def get_asr_pipeline() -> Any:
 ProgressCallback = Callable[[str, float, Optional[Dict[str, Any]]], None]
 
 
+def _reconcile_chunks_with_whisper_timestamps(
+    chunk: Any,
+    result: Dict[str, Any],
+    formatted_text: str,
+) -> List[Dict[str, Any]]:
+    """
+    Split a chunk into multiple sub-chunks if Whisper detected multiple sentences.
+    
+    Uses word-level timestamps from Whisper to determine sentence boundaries.
+    
+    Args:
+        chunk: The original SentenceChunk
+        result: Whisper result with potential word timestamps
+        formatted_text: The formatted text with punctuation
+        
+    Returns:
+        List of sub-chunks with refined boundaries
+    """
+    from ..utils.punctuation import split_into_sentences
+    
+    # Try to split into sentences
+    sentences = split_into_sentences(formatted_text, lang="sme")
+    
+    # If only one sentence or no word timestamps, return as-is
+    chunks_data = result.get("chunks", [])
+    if len(sentences) <= 1 or not chunks_data:
+        return [{
+            "text": formatted_text,
+            "start_ms": chunk.start_ms,
+            "end_ms": chunk.end_ms,
+            "speaker": chunk.speaker,
+            "is_question": chunk.is_question,
+        }]
+    
+    # Build word timing map
+    words_with_times = []
+    for word_chunk in chunks_data:
+        if isinstance(word_chunk, dict) and "timestamp" in word_chunk:
+            word_text = word_chunk.get("text", "").strip()
+            timestamp = word_chunk.get("timestamp", [0.0, 0.0])
+            if word_text and len(timestamp) == 2:
+                words_with_times.append({
+                    "text": word_text,
+                    "start": timestamp[0],
+                    "end": timestamp[1],
+                })
+    
+    if not words_with_times:
+        return [{
+            "text": formatted_text,
+            "start_ms": chunk.start_ms,
+            "end_ms": chunk.end_ms,
+            "speaker": chunk.speaker,
+            "is_question": chunk.is_question,
+        }]
+    
+    # Try to align sentences with word timestamps
+    result_chunks = []
+    word_idx = 0
+    
+    for sent in sentences:
+        sent_words = sent.lower().split()
+        if not sent_words:
+            continue
+        
+        # Find matching words in the timestamp list
+        sent_start_time = None
+        sent_end_time = None
+        matches = 0
+        
+        while word_idx < len(words_with_times) and matches < len(sent_words):
+            word_data = words_with_times[word_idx]
+            word_text_clean = re.sub(r'[^\w\s]', '', word_data["text"].lower())
+            
+            if sent_start_time is None:
+                sent_start_time = word_data["start"]
+            
+            sent_end_time = word_data["end"]
+            matches += 1
+            word_idx += 1
+        
+        if sent_start_time is not None and sent_end_time is not None:
+            # Convert to absolute milliseconds
+            abs_start_ms = chunk.start_ms + int(sent_start_time * 1000)
+            abs_end_ms = chunk.start_ms + int(sent_end_time * 1000)
+            
+            result_chunks.append({
+                "text": sent,
+                "start_ms": abs_start_ms,
+                "end_ms": abs_end_ms,
+                "speaker": chunk.speaker,
+                "is_question": sent.rstrip().endswith("?"),
+            })
+    
+    # If we couldn't split properly, return original
+    if not result_chunks:
+        return [{
+            "text": formatted_text,
+            "start_ms": chunk.start_ms,
+            "end_ms": chunk.end_ms,
+            "speaker": chunk.speaker,
+            "is_question": chunk.is_question,
+        }]
+    
+    return result_chunks
+
+
 def transcribe(
     file_path: str | Path,
     *,
@@ -159,22 +266,49 @@ def transcribe(
             if not formatted_text:
                 continue
 
-            speaker_label = (chunk.speaker or "unknown").strip() or "unknown"
-            if combined_blocks and combined_blocks[-1]["speaker"] == speaker_label:
-                combined_blocks[-1]["texts"].append(formatted_text)
-            else:
-                combined_blocks.append({"speaker": speaker_label, "texts": [formatted_text]})
-            combined_segments.append(
-                {
-                    "timestamp": (
-                        chunk.start_ms / 1000.0,
-                        chunk.end_ms / 1000.0,
-                    ),
-                    "text": formatted_text,
-                    "speaker": chunk.speaker or "unknown",
-                    "question": is_question,
-                }
+            # Reconcile chunks using Whisper word timestamps
+            # This may split one chunk into multiple sentences
+            sub_chunks = _reconcile_chunks_with_whisper_timestamps(
+                chunk, result, formatted_text
             )
+            
+            for sub_chunk in sub_chunks:
+                sub_text = sub_chunk["text"]
+                sub_speaker = (sub_chunk["speaker"] or "unknown").strip() or "unknown"
+                sub_is_question = sub_chunk["is_question"]
+                
+                # Build combined blocks (for the main text output)
+                if combined_blocks and combined_blocks[-1]["speaker"] == sub_speaker:
+                    combined_blocks[-1]["texts"].append(sub_text)
+                else:
+                    combined_blocks.append({"speaker": sub_speaker, "texts": [sub_text]})
+                
+                # Extract word-level timestamps if available
+                word_timestamps = []
+                chunks_data = (result or {}).get("chunks", [])
+                if chunks_data:
+                    for word_chunk in chunks_data:
+                        if isinstance(word_chunk, dict):
+                            word_timestamps.append({
+                                "text": word_chunk.get("text", ""),
+                                "timestamp": word_chunk.get("timestamp", [0.0, 0.0]),
+                            })
+                
+                segment_info = {
+                    "timestamp": (
+                        sub_chunk["start_ms"] / 1000.0,
+                        sub_chunk["end_ms"] / 1000.0,
+                    ),
+                    "text": sub_text,
+                    "speaker": sub_speaker,
+                    "question": sub_is_question,
+                }
+                
+                # Add word timestamps if available
+                if word_timestamps:
+                    segment_info["words"] = word_timestamps
+                
+                combined_segments.append(segment_info)
 
     combined_text = "\n\n".join(
         f"{block['speaker']}: {' '.join(block['texts'])}"
@@ -220,12 +354,13 @@ def _transcribe_in_batches(
             batch_outputs = pipeline_(
                 batch_inputs,
                 batch_size=len(batch_inputs),
-                return_timestamps=True,
+                return_timestamps="word",  # Request word-level timestamps
                 generate_kwargs={"temperature": temperature},
             )
         except ValueError as exc:
             message = str(exc)
             if "Whisper did not predict an ending timestamp" in message:
+                # Fallback to no timestamps for problematic chunks
                 for item in batch_inputs:
                     single_output = pipeline_(
                         [item],
@@ -288,11 +423,42 @@ QUESTION_WORDS = {
 
 
 def _format_sentence(raw_text: str, audio_question: bool) -> tuple[str, bool]:
+    """
+    Format a transcribed sentence with proper punctuation using Stanza NLP.
+    
+    Args:
+        raw_text: Raw transcription text
+        audio_question: Whether audio analysis (pitch) suggests a question
+        
+    Returns:
+        Tuple of (formatted_text, is_question)
+    """
+    from ..utils.punctuation import restore_punctuation
+    
     text = raw_text.strip()
     if not text:
         return "", False
 
+    # Normalize spacing first
     text = _normalise_spacing(text)
+    
+    # Use Stanza to restore proper punctuation
+    try:
+        punctuated = restore_punctuation(
+            text,
+            lang="sme",  # Northern Sámi (falls back to Norwegian in implementation)
+            audio_is_question=audio_question,
+        )
+        return punctuated.text, punctuated.is_question
+        
+    except Exception as exc:
+        logger.debug("Punctuation restoration failed, using fallback: %s", exc)
+        # Fallback to simple formatting
+        return _format_sentence_fallback(text, audio_question)
+
+
+def _format_sentence_fallback(text: str, audio_question: bool) -> tuple[str, bool]:
+    """Fallback formatting when Stanza is unavailable."""
     question = audio_question or _looks_like_question(text)
 
     first_char = text[0]
