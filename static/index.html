@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Samisk Transkribering</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="static/styles.css">
 </head>
 <body>
   <main class="shell">
@@ -227,7 +227,7 @@
 
     async function checkServerStatus() {
       try {
-        const response = await fetch('/api/transcriptions/status');
+        const response = await fetch('api/transcriptions/status');
         if (!response.ok) return;
         
         const data = await response.json();
@@ -490,7 +490,7 @@
       resetOutput();
     });
 
-    form.addEventListener('submit', async (event) => {
+  form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const file = fileInput.files?.[0] || selectedFile;
       if (!file) {
@@ -505,7 +505,7 @@
       setPhase('uploading');
 
       try {
-        const response = await fetch('/api/transcriptions', {
+        const response = await fetch('api/transcriptions', {
           method: 'POST',
           body: formData,
         });
@@ -547,7 +547,7 @@
           if (currentSessionId) {
             headers['X-Session-Id'] = currentSessionId;
           }
-          const response = await fetch(`/api/transcriptions/${currentJobId}`, { headers });
+          const response = await fetch(`api/transcriptions/${currentJobId}`, { headers });
           if (!response.ok) {
             throw new Error('Failed to retrieve job status');
           }
@@ -586,7 +586,7 @@
         if (currentSessionId) {
           headers['X-Session-Id'] = currentSessionId;
         }
-        const response = await fetch(`/api/transcriptions/${currentJobId}/finalise`, {
+        const response = await fetch(`api/transcriptions/${currentJobId}/finalise`, {
           method: 'POST',
           headers,
           body: JSON.stringify({ text: transcriptText.value }),
@@ -613,8 +613,8 @@
 
     downloadBtn.addEventListener('click', () => {
       if (!currentJobId || !currentSessionId) return;
-      // Create a temporary link with session ID as query param for download
-      const url = `/api/transcriptions/${currentJobId}/download`;
+  // Create a temporary link with session ID as query param for download
+  const url = `api/transcriptions/${currentJobId}/download`;
       const a = document.createElement('a');
       a.href = url;
       a.download = '';
@@ -666,7 +666,7 @@
         if (currentSessionId) {
           headers['X-Session-Id'] = currentSessionId;
         }
-        const response = await fetch(`/api/transcriptions/${session.jobId}`, { headers });
+  const response = await fetch(`api/transcriptions/${session.jobId}`, { headers });
         if (!response.ok) {
           // Job not found or server error - clear invalid session
           clearSession();
@@ -706,7 +706,7 @@
     // Initialize session restoration when page loads
     (async function init() {
       // First check if server is busy
-      const statusResponse = await fetch('/api/transcriptions/status').catch(() => null);
+  const statusResponse = await fetch('api/transcriptions/status').catch(() => null);
       if (statusResponse?.ok) {
         const statusData = await statusResponse.json();
         
