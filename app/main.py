@@ -35,6 +35,23 @@ app.add_middleware(
     allow_credentials=True,
 )
 
+
+@app.middleware("http")
+async def forwarded_prefix_middleware(request, call_next):
+    """Honor X-Forwarded-Prefix so docs/OpenAPI work behind a reverse proxy path prefix."""
+    prefix = request.headers.get("x-forwarded-prefix")
+    if prefix:
+        normalized = "/" + prefix.lstrip("/")
+        request.scope["root_path"] = normalized.rstrip("/")
+    return await call_next(request)
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """Health check endpoint for reverse proxies and monitors."""
+    return {"status": "ok"}
+
+
 app.include_router(transcription_router)
 
 static_directory = Path(__file__).resolve().parent.parent / "static"

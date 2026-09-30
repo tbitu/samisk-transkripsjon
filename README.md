@@ -45,7 +45,7 @@ Create a persistent cache volume and start the service with GPU support:
 # Provide Hugging Face token (required for pyannote speaker diarization)
 export HF_TOKEN="your_hf_token_here"
 
-# Start the service
+# Start the service (runs on port 12000 by default)
 docker compose up
 ```
 
@@ -63,8 +63,8 @@ docker volume create hf-cache
 docker volume create torch-cache
 docker volume create samisk-transkripsjon-storage
 
-# Run the container with GPU acceleration
-docker run --rm -p 8000:8000 --gpus all \
+# Run the container with GPU acceleration on port 12000
+docker run --rm -p 12000:8000 --gpus all \
   -e HF_TOKEN="your_hf_token_here" \
   -v hf-cache:/data/hf \
   -v torch-cache:/data/torch \
@@ -72,7 +72,31 @@ docker run --rm -p 8000:8000 --gpus all \
   ghcr.io/tbitu/samisk-transkripsjon:latest
 ```
 
-Then open `http://localhost:8000` in your browser.
+Then open `http://localhost:12000` in your browser.
+
+### Reverse Proxy Configuration (e.g., samiailab)
+
+The server listens on host port `12000` (within the exposed `12000-12100` range). The application honors `X-Forwarded-Prefix` so you can reverse proxy from a subpath or dedicated domain.
+
+Example Apache reverse proxy:
+
+```apache
+<Location /transcription>
+    ProxyPass http://localhost:12000
+    ProxyPassReverse http://localhost:12000
+    RequestHeader set X-Forwarded-Prefix "/transcription"
+</Location>
+```
+
+Example Nginx reverse proxy:
+
+```nginx
+location /transcription/ {
+    proxy_pass http://localhost:12000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Prefix /transcription;
+}
+```
 
 ### Multi-Architecture Support (ARM64 & AMD64)
 
