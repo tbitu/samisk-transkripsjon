@@ -4,6 +4,20 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Samisk Transkribering</title>
+  <script>
+    // Ensure relative paths (static/..., api/...) resolve correctly if accessed without trailing slash
+    (function() {
+      var p = window.location.pathname;
+      if (!p.endsWith('/') && !p.split('/').pop().includes('.')) {
+        if (!document.querySelector('base')) {
+          var b = document.createElement('base');
+          b.href = p + '/';
+          document.head.appendChild(b);
+        }
+        window.history.replaceState(null, '', p + '/' + window.location.search + window.location.hash);
+      }
+    })();
+  </script>
   <link rel="stylesheet" href="static/styles.css">
 </head>
 <body>

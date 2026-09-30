@@ -93,3 +93,42 @@ def test_transcription_flow(client: TestClient):
     assert download_resp.status_code == 200
     assert download_resp.headers["content-type"].startswith("application/pdf")
     assert download_resp.content.startswith(b"%PDF")
+
+
+def test_health_check(client: TestClient):
+    get_resp = client.get("/health")
+    assert get_resp.status_code == 200
+    assert get_resp.json() == {"status": "ok"}
+
+    head_resp = client.head("/health")
+    assert head_resp.status_code == 200
+
+
+def test_index_page(client: TestClient):
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "<base href=\"./\">" in resp.text
+
+    head_resp = client.head("/")
+    assert head_resp.status_code == 200
+
+
+def test_index_page_with_forwarded_prefix(client: TestClient):
+    resp = client.get("/", headers={"x-forwarded-prefix": "/transcription"})
+    assert resp.status_code == 200
+    assert "<base href=\"/transcription/\">" in resp.text
+
+
+def test_static_css_with_and_without_prefix(client: TestClient):
+    # Direct access without reverse proxy prefix
+    direct_resp = client.get("/static/styles.css")
+    assert direct_resp.status_code == 200
+    assert "text/css" in direct_resp.headers["content-type"]
+    assert "--primary" in direct_resp.text
+
+    # Reverse proxy access with X-Forwarded-Prefix
+    proxy_resp = client.get("/static/styles.css", headers={"x-forwarded-prefix": "/transcription"})
+    assert proxy_resp.status_code == 200
+    assert "text/css" in proxy_resp.headers["content-type"]
+    assert "--primary" in proxy_resp.text
+

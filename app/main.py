@@ -2,17 +2,16 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .routes.transcription import router as transcription_router
-from pathlib import Path
-import os
-from fastapi import HTTPException
 
 # Configure logging for the entire application
 logging.basicConfig(
@@ -36,17 +35,31 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def forwarded_prefix_middleware(request, call_next):
-    """Honor X-Forwarded-Prefix so docs/OpenAPI work behind a reverse proxy path prefix."""
-    prefix = request.headers.get("x-forwarded-prefix")
-    if prefix:
-        normalized = "/" + prefix.lstrip("/")
-        request.scope["root_path"] = normalized.rstrip("/")
-    return await call_next(request)
+class ForwardedPrefixMiddleware:
+    """Honor X-Forwarded-Prefix for reverse proxies (e.g. Apache/Nginx subpaths)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] in ("http", "websocket"):
+            headers = dict(scope.get("headers", []))
+            prefix = headers.get(b"x-forwarded-prefix")
+            if prefix:
+                prefix_str = "/" + prefix.decode("latin1").strip("/")
+                scope["root_path"] = prefix_str
+                # Ensure scope["path"] matches scope["root_path"] prefix so Starlette Mount/StaticFiles
+                # and sub-routers calculate correct relative lookup paths.
+                if not scope["path"].startswith(prefix_str):
+                    scope["path"] = prefix_str + scope["path"]
+                    scope["raw_path"] = scope["path"].encode("latin1")
+        await self.app(scope, receive, send)
 
 
-@app.get("/health")
+app.add_middleware(ForwardedPrefixMiddleware)
+
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health() -> dict[str, str]:
     """Health check endpoint for reverse proxies and monitors."""
     return {"status": "ok"}
@@ -58,10 +71,18 @@ static_directory = Path(__file__).resolve().parent.parent / "static"
 app.mount("/static", StaticFiles(directory=static_directory), name="static")
 
 
-@app.get("/")
-async def index() -> FileResponse:
+@app.api_route("/", methods=["GET", "HEAD"])
+@app.api_route("/index.html", methods=["GET", "HEAD"])
+async def index(request: Request) -> Response:
+    """Serve web application with dynamically injected base href for proxy subpaths."""
     index_path = static_directory / "index.html"
-    return FileResponse(index_path)
+    prefix = request.headers.get("x-forwarded-prefix") or request.scope.get("root_path") or ""
+    prefix = prefix.strip("/")
+    base_href = f"/{prefix}/" if prefix else "./"
+
+    content = index_path.read_text(encoding="utf-8")
+    content = content.replace("<head>", f'<head>\n  <base href="{base_href}">', 1)
+    return HTMLResponse(content=content)
 
 
 @app.on_event("startup")
