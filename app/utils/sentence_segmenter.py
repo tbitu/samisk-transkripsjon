@@ -249,16 +249,8 @@ def prepare_sentence_chunks(
 
 
 def _has_hf_token() -> bool:
-    """Return True if an HF token is available via env or ./hf_token file."""
-    token = (
-        os.environ.get("PYANNOTE_AUTH_TOKEN")
-        or os.environ.get("HUGGINGFACE_TOKEN")
-        or os.environ.get("HF_TOKEN")
-    )
-    if token:
-        return True
-    token_file = Path(__file__).resolve().parents[2] / "hf_token"
-    return token_file.exists() and token_file.read_text().strip() != ""
+    """Return True if an HF token is available via env, .env, or disk file."""
+    return _get_hf_token() is not None
 
 
 def _run_diarization(
@@ -376,22 +368,47 @@ def _offload_diarization_pipeline() -> None:
 
 
 def _get_hf_token() -> Optional[str]:
-    """Retrieve the Hugging Face token from the environment or a file."""
+    """Retrieve the Hugging Face token from environment, .env, or on-disk files."""
     import os
-    token = os.environ.get("HF_TOKEN")
-    if token:
-        return token
-    
-    # Check for a file named 'hf_token' in the root directory
+
+    # 1. Check environment variables
+    for var in ("PYANNOTE_AUTH_TOKEN", "HF_TOKEN", "HUGGINGFACE_TOKEN"):
+        val = os.environ.get(var)
+        if val and val.strip():
+            return val.strip()
+
+    # 2. Check candidate file paths on disk
+    candidate_paths: list[Path] = []
+
+    # Project root ./hf_token
     try:
         from .. import main
-        root_dir = Path(main.__file__).parent.parent
-        token_file = root_dir / "hf_token"
-        if token_file.exists():
-            return token_file.read_text().strip()
+        root_dir = Path(main.__file__).resolve().parent.parent
+        candidate_paths.append(root_dir / "hf_token")
     except Exception:
         pass
-        
+
+    # Persistent Docker cache volume locations (/data/hf/token or /data/hf/hf_token)
+    candidate_paths.append(Path("/data/hf/token"))
+    candidate_paths.append(Path("/data/hf/hf_token"))
+
+    # Standard Hugging Face CLI login token path on host (~/.cache/huggingface/token)
+    try:
+        candidate_paths.append(Path.home() / ".cache" / "huggingface" / "token")
+    except Exception:
+        pass
+
+    for path in candidate_paths:
+        try:
+            if path.is_file():
+                content = path.read_text().strip()
+                if content:
+                    os.environ["HF_TOKEN"] = content
+                    os.environ["PYANNOTE_AUTH_TOKEN"] = content
+                    return content
+        except Exception:
+            continue
+
     return None
 
 

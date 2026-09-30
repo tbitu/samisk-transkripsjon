@@ -13,10 +13,14 @@ services:
     ports:
       - "${PORT:-12000}:8000"
 
+    env_file:
+      - path: .env
+        required: false
+
     environment:
-      # Hugging Face token required for pyannote diarization models
-      - HF_TOKEN=${HF_TOKEN}
-      - PYANNOTE_AUTH_TOKEN=${PYANNOTE_AUTH_TOKEN:-${HF_TOKEN}}
+      # Hugging Face token required for pyannote diarization models (loaded from .env or host)
+      - HF_TOKEN=${HF_TOKEN:-}
+      - PYANNOTE_AUTH_TOKEN=${PYANNOTE_AUTH_TOKEN:-${HF_TOKEN:-}}
       - HF_CACHE_DIR=/data/hf
       - TORCH_HOME=/data/torch
 

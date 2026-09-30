@@ -67,19 +67,19 @@ async def index() -> FileResponse:
 @app.on_event("startup")
 def ensure_diarization_token_available() -> None:
     """Ensure a Hugging Face token is available for pyannote diarization."""
-    token = (
-        os.environ.get("PYANNOTE_AUTH_TOKEN")
-        or os.environ.get("HUGGINGFACE_TOKEN")
-        or os.environ.get("HF_TOKEN")
-    )
-    if token:
-        return
+    from .utils.sentence_segmenter import _get_hf_token
 
-    token_file = Path(__file__).resolve().parents[1] / "hf_token"
-    if token_file.exists() and token_file.read_text().strip():
+    token = _get_hf_token()
+    if token:
+        os.environ["HF_TOKEN"] = token
+        os.environ["PYANNOTE_AUTH_TOKEN"] = token
         return
 
     raise RuntimeError(
         "Missing Hugging Face token required for speaker diarization. "
-        "Set PYANNOTE_AUTH_TOKEN/HUGGINGFACE_TOKEN/HF_TOKEN or place token in ./hf_token."
+        "Store your token on disk in one of the following locations: "
+        "1) .env file in project directory (HF_TOKEN=hf_...); "
+        "2) ./hf_token file; "
+        "3) /data/hf/token or ~/.cache/huggingface/token; "
+        "or pass it via environment variable HF_TOKEN."
     )
