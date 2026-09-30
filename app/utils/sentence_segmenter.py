@@ -319,7 +319,7 @@ def _load_diarization_pipeline(
         from pyannote.audio import Pipeline
         pipeline = Pipeline.from_pretrained(
             DIARIZATION_MODEL_ID,
-            token=hf_token,
+            use_auth_token=hf_token,
         )
 
         if torch.cuda.is_available():

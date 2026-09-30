@@ -137,5 +137,126 @@ def _ensure():
 
     setattr(torchaudio, "info", _safe_info)
 
+    _shim_huggingface_hub()
+    _shim_torch_load()
+    _shim_semver()
+    _shim_pyannote()
+
+
+def _shim_huggingface_hub() -> None:
+    """Map legacy use_auth_token parameter to token in huggingface_hub.hf_hub_download."""
+    try:
+        import huggingface_hub
+        orig_download = getattr(huggingface_hub, "hf_hub_download", None)
+        if orig_download is None:
+            return
+
+        def _compat_hf_hub_download(*args: Any, **kwargs: Any) -> Any:
+            if "use_auth_token" in kwargs:
+                token = kwargs.pop("use_auth_token")
+                if "token" not in kwargs and token is not None:
+                    kwargs["token"] = token
+            return orig_download(*args, **kwargs)
+
+        setattr(huggingface_hub, "hf_hub_download", _compat_hf_hub_download)
+
+        for mod_name in ("pyannote.audio.core.pipeline", "pyannote.audio.core.model"):
+            try:
+                mod = __import__(mod_name, fromlist=["hf_hub_download"])
+                if hasattr(mod, "hf_hub_download"):
+                    setattr(mod, "hf_hub_download", _compat_hf_hub_download)
+            except Exception:
+                pass
+        logger.debug("Injected huggingface_hub use_auth_token shim")
+    except Exception:
+        pass
+
+
+def _shim_torch_load() -> None:
+    """Ensure torch.load defaults to weights_only=False for PyTorch Lightning/pyannote checkpoints."""
+    global torch
+    if torch is None:
+        return
+    orig_torch_load = getattr(torch, "load", None)
+    if orig_torch_load is None:
+        return
+
+    def _compat_torch_load(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("weights_only") is None:
+            kwargs["weights_only"] = False
+        return orig_torch_load(*args, **kwargs)
+
+    setattr(torch, "load", _compat_torch_load)
+
+    try:
+        import torch.torch_version  # type: ignore
+        torch.serialization.add_safe_globals([torch.torch_version.TorchVersion])
+    except Exception:
+        pass
+    logger.debug("Injected torch.load weights_only compatibility shim")
+
+
+def _shim_semver() -> None:
+    """Ensure semver.VersionInfo.parse does not crash on non-standard build strings (e.g. NGC PyTorch versions)."""
+    try:
+        import re
+        import semver
+
+        orig_parse = semver.VersionInfo.parse
+
+        def _safe_semver_parse(version: Any) -> Any:
+            try:
+                return orig_parse(str(version))
+            except ValueError:
+                match = re.match(r"^(\d+)\.(\d+)\.?(\d+)?", str(version))
+                if match:
+                    major, minor, patch = match.groups()
+                    return orig_parse(f"{major}.{minor}.{patch or 0}")
+                raise
+
+        semver.VersionInfo.parse = _safe_semver_parse
+        logger.debug("Injected semver.VersionInfo.parse shim")
+    except Exception:
+        pass
+
+
+def _shim_pyannote() -> None:
+    """Provide signature flexibility and version check compatibility for pyannote.audio."""
+    try:
+        import pyannote.audio.utils.version as pa_version
+
+        def _safe_check_version(library: str, theirs: str, mine: str, what: str = "Pipeline") -> None:
+            pass  # Suppress strict semver parsing warnings/crashes
+
+        pa_version.check_version = _safe_check_version
+
+        for mod_name in ("pyannote.audio.core.pipeline", "pyannote.audio.core.model"):
+            try:
+                mod = __import__(mod_name, fromlist=["check_version"])
+                if hasattr(mod, "check_version"):
+                    setattr(mod, "check_version", _safe_check_version)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        from pyannote.audio import Pipeline
+
+        orig_pipeline_from_pretrained = Pipeline.from_pretrained
+
+        @classmethod
+        def _compat_pipeline_from_pretrained(cls: Any, *args: Any, **kwargs: Any) -> Any:
+            # Support both token and use_auth_token kwargs seamlessly
+            token = kwargs.pop("token", None)
+            if token is not None and "use_auth_token" not in kwargs:
+                kwargs["use_auth_token"] = token
+            return orig_pipeline_from_pretrained(*args, **kwargs)
+
+        Pipeline.from_pretrained = _compat_pipeline_from_pretrained
+        logger.debug("Injected pyannote.audio Pipeline.from_pretrained shim")
+    except Exception:
+        pass
+
 
 _ensure()
