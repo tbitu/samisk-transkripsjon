@@ -16,13 +16,14 @@ class DummyManager:
         self.workspace = workspace
         self.jobs: dict[str, TranscriptionJob] = {}
 
-    def submit(self, uploaded_path: Path) -> TranscriptionJob:
+    def submit(self, uploaded_path: Path, session_id: str | None = None) -> TranscriptionJob:
         job_id = "test-job"
         stored_path = self.workspace / f"{job_id}{uploaded_path.suffix}"
         stored_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(uploaded_path, stored_path)
         job = TranscriptionJob(
             job_id=job_id,
+            session_id=session_id,
             source_path=stored_path,
             status="completed",
             text="stub transcription",
@@ -68,7 +69,10 @@ def test_transcription_flow(client: TestClient):
     assert payload["progress"]["step"] == pytest.approx(100.0)
     assert payload["current_step"] == "Completed"
 
-    status_resp = client.get(f"/api/transcriptions/{payload['job_id']}")
+    session_id = payload["session_id"]
+    headers = {"x-session-id": session_id}
+
+    status_resp = client.get(f"/api/transcriptions/{payload['job_id']}", headers=headers)
     assert status_resp.status_code == 200
     status_payload = status_resp.json()
     assert status_payload["status"] == "completed"
@@ -77,11 +81,15 @@ def test_transcription_flow(client: TestClient):
     final_resp = client.post(
         f"/api/transcriptions/{payload['job_id']}/finalise",
         json={"text": "corrected text"},
+        headers=headers,
     )
     assert final_resp.status_code == 200
     assert final_resp.json()["text"] == "corrected text"
 
-    download_resp = client.get(f"/api/transcriptions/{payload['job_id']}/download")
+    download_resp = client.get(
+        f"/api/transcriptions/{payload['job_id']}/download",
+        headers=headers,
+    )
     assert download_resp.status_code == 200
     assert download_resp.headers["content-type"].startswith("application/pdf")
     assert download_resp.content.startswith(b"%PDF")

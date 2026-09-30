@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+.venv/
+venv/
+.git/
+.github/
+.devcontainer/
+.env
+.env.*
+docker-compose*.yml
+
+# Local storage and caches
+storage/
+.cache/
+hf-cache/
+torch-cache/
+hf_token

@@ -133,7 +133,11 @@ def restore_punctuation(
         
         # Normalize spacing around punctuation
         result_text = _normalize_punctuation_spacing(result_text)
-        
+
+        # Ensure sentence ending matches question determination
+        if is_question and result_text.endswith("."):
+            result_text = result_text[:-1] + "?"
+
         return PunctuatedText(
             text=result_text,
             is_question=is_question,

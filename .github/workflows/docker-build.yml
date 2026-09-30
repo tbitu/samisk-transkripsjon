@@ -1,0 +1,283 @@
+name: Docker build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+
+    outputs:
+      built: ${{ steps.out.outputs.built }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space (GitHub runner)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -h
+          # Docker builds from large bases can exceed GitHub-hosted runner disk.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache || true
+          sudo docker system prune -af || true
+          df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check NGC base image availability (anonymous or logged-in)
+        id: ngc
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect nvcr.io/nvidia/pytorch:25.12-py3 >/dev/null 2>&1; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "NGC base image is accessible."
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "NGC base image is NOT accessible from this runner."
+            echo "If nvcr.io requires authentication from GitHub runners, this workflow cannot proceed without credentials."
+          fi
+
+      - name: Compute image name
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        if: steps.ngc.outputs.ok == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (base tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable=${{ (github.event_name == 'release' && github.event.release.prerelease == false) || (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') }}
+
+      - name: Compute amd64 tag list
+        if: steps.ngc.outputs.ok == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags='${{ steps.meta.outputs.tags }}'
+          # Append a suffix so per-arch pushes do not race on the same tag.
+          printf '%s\n' "$tags" | sed 's/$/-amd64/' > /tmp/tags.txt
+          {
+            echo 'ARCH_TAGS<<EOF'
+            cat /tmp/tags.txt
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Build and push (amd64)
+        if: steps.ngc.outputs.ok == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          tags: ${{ env.ARCH_TAGS }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Record build outcome
+        id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.ngc.outputs.ok }}" = "true" ]; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip build (NGC base not accessible)
+        if: steps.ngc.outputs.ok != 'true'
+        run: |
+          echo "Skipping Docker build because nvcr.io/nvidia/pytorch:25.12-py3 is not accessible."
+          echo "This Dockerfile depends on nvcr.io/nvidia/pytorch; GitHub runners may require credentials to access it."
+
+  build-arm64:
+    runs-on: ubuntu-latest
+
+    outputs:
+      built: ${{ steps.out.outputs.built }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space (GitHub runner)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -h
+          # Docker builds from large bases can exceed GitHub-hosted runner disk.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache || true
+          sudo docker system prune -af || true
+          df -h
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check NGC base image availability (anonymous or logged-in)
+        id: ngc
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect nvcr.io/nvidia/pytorch:25.12-py3 >/dev/null 2>&1; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "NGC base image is accessible."
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "NGC base image is NOT accessible from this runner."
+            echo "If nvcr.io requires authentication from GitHub runners, this workflow cannot proceed without credentials."
+          fi
+
+      - name: Compute image name
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        if: steps.ngc.outputs.ok == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (base tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable=${{ (github.event_name == 'release' && github.event.release.prerelease == false) || (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') }}
+
+      - name: Compute arm64 tag list
+        if: steps.ngc.outputs.ok == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags='${{ steps.meta.outputs.tags }}'
+          printf '%s\n' "$tags" | sed 's/$/-arm64/' > /tmp/tags.txt
+          {
+            echo 'ARCH_TAGS<<EOF'
+            cat /tmp/tags.txt
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Build and push (arm64)
+        if: steps.ngc.outputs.ok == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/arm64
+          provenance: false
+          sbom: false
+          tags: ${{ env.ARCH_TAGS }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Record build outcome
+        id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.ngc.outputs.ok }}" = "true" ]; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip build (NGC base not accessible)
+        if: steps.ngc.outputs.ok != 'true'
+        run: |
+          echo "Skipping Docker build because nvcr.io/nvidia/pytorch:25.12-py3 is not accessible."
+          echo "This Dockerfile depends on nvcr.io/nvidia/pytorch; GitHub runners may require credentials to access it."
+
+  publish-manifest:
+    runs-on: ubuntu-latest
+    needs:
+      - build-amd64
+      - build-arm64
+    if: needs.build-amd64.outputs.built == 'true' && needs.build-arm64.outputs.built == 'true'
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image name
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (base tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable=${{ (github.event_name == 'release' && github.event.release.prerelease == false) || (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') }}
+
+      - name: Publish multi-arch manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Creating multi-arch manifests for:"
+          echo '${{ steps.meta.outputs.tags }}'
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "Publishing manifest: $tag"
+            docker buildx imagetools create \
+              -t "$tag" \
+              "${tag}-amd64" \
+              "${tag}-arm64"
+          done <<'EOF'
+          ${{ steps.meta.outputs.tags }}
+          EOF

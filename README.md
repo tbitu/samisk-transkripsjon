@@ -35,7 +35,61 @@ You can manually install a Unicode-capable font by placing a TTF file at
 `static/fonts/DejaVuSans.ttf` (or edit `app/utils/pdf.py` to point to a
 different font).
 
-## Getting Started
+## Quickstart with Docker (Recommended)
+
+### Using Docker Compose
+
+Create a persistent cache volume and start the service with GPU support:
+
+```bash
+# Provide Hugging Face token (required for pyannote speaker diarization)
+export HF_TOKEN="your_hf_token_here"
+
+# Start the service
+docker compose up
+```
+
+If your Docker setup requires an explicit GPU flag:
+
+```bash
+docker compose run --gpus all --service-ports samisk-transkripsjon
+```
+
+### Using `docker run`
+
+```bash
+# Create persistent cache volumes
+docker volume create hf-cache
+docker volume create torch-cache
+docker volume create samisk-transkripsjon-storage
+
+# Run the container with GPU acceleration
+docker run --rm -p 8000:8000 --gpus all \
+  -e HF_TOKEN="your_hf_token_here" \
+  -v hf-cache:/data/hf \
+  -v torch-cache:/data/torch \
+  -v samisk-transkripsjon-storage:/app/storage \
+  ghcr.io/tbitu/samisk-transkripsjon:latest
+```
+
+Then open `http://localhost:8000` in your browser.
+
+### Multi-Architecture Support (ARM64 & AMD64)
+
+The Docker image and GitHub Actions workflow support both:
+- **`linux/arm64`**: Tested on NVIDIA Grace Blackwell (GB10 / DX Spark / SBSA) using NVIDIA's NGC PyTorch base image with native CUDA acceleration.
+- **`linux/amd64`**: Standard x86_64 servers with NVIDIA GPUs.
+
+Multi-arch builds are automated via `.github/workflows/docker-build.yml` which builds on both architectures and publishes unified multi-arch manifest lists to GitHub Container Registry (GHCR).
+
+### Devcontainer
+
+A development container configuration is included in `.devcontainer/devcontainer.json`. It supports:
+- Remote VS Code / Cursor development.
+- Docker-outside-of-docker (bind-mounting host docker socket `/run/user/1003/docker.sock` for rootless docker).
+- Sharing the host user's Hugging Face cache directory.
+
+## Local Python Environment (Alternative)
 
 ```bash
 python -m venv .venv
@@ -57,12 +111,7 @@ python -m pip install --index-url https://download.pytorch.org/whl/cu129 \
 To run the API server:
 
 ```bash
-uvicorn app.main:app --reload
-```
-
-When running inside the project's virtual environment, it's often more reliable to run the server using the venv's Python interpreter so the correct site-packages are used. The following is recommended and is what worked in the repo environment:
-
-```bash
+export HF_TOKEN="your_hf_token_here"
 python -m uvicorn app.main:app --reload
 ```
 

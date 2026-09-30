@@ -1,0 +1,49 @@
+services:
+  samisk-transkripsjon:
+    # Use the prebuilt GHCR image (same convention as sami-translation-backend)
+    image: ghcr.io/tbitu/samisk-transkripsjon:latest
+
+    # Alternative: build from source (uncomment if developing locally)
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    #   args:
+    #     BASE_IMAGE: ${BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.12-py3}
+
+    ports:
+      - "${PORT:-8000}:8000"
+
+    environment:
+      # Hugging Face token required for pyannote diarization models
+      - HF_TOKEN=${HF_TOKEN}
+      - PYANNOTE_AUTH_TOKEN=${PYANNOTE_AUTH_TOKEN:-${HF_TOKEN}}
+      - HF_CACHE_DIR=/data/hf
+      - TORCH_HOME=/data/torch
+
+    volumes:
+      # Persistent cache stores for models
+      - hf-cache:/data/hf
+      - torch-cache:/data/torch
+
+      # Persistent storage for job audio uploads and transcripts
+      - transcription-storage:/app/storage
+
+      # Alternative: bind-mount a host directory for Hugging Face cache
+      # - ${HF_CACHE_HOST_DIR:-${HOME}/.cache/huggingface}:/data/hf
+
+    # GPU support (Docker Engine + NVIDIA Container Toolkit):
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:
+    name: hf-cache
+  torch-cache:
+    name: torch-cache
+  transcription-storage:
+    name: samisk-transkripsjon-storage
