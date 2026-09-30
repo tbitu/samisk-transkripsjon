@@ -46,7 +46,19 @@ def _soundfile_load(filepath: Any, *args: Any, **kwargs: Any) -> Tuple[Any, int]
     """Load audio file using soundfile and return (waveform, sample_rate)."""
     if sf is None or torch is None:
         raise RuntimeError("soundfile and torch are required for audio loading fallback")
-    data, sr = sf.read(filepath, dtype="float32", always_2d=True)
+
+    # torchaudio.load supports frame_offset and num_frames (positional or keyword)
+    frame_offset = kwargs.get("frame_offset", 0)
+    num_frames = kwargs.get("num_frames", -1)
+    if len(args) >= 1:
+        frame_offset = args[0]
+    if len(args) >= 2:
+        num_frames = args[1]
+
+    start = max(0, int(frame_offset))
+    frames = int(num_frames) if num_frames is not None and num_frames > 0 else -1
+
+    data, sr = sf.read(filepath, start=start, frames=frames, dtype="float32", always_2d=True)
     # soundfile returns (frames, channels), PyTorch expects (channels, frames)
     waveform = torch.from_numpy(data.T)
     return waveform, sr
@@ -57,11 +69,20 @@ def _soundfile_info(filepath: Any, *args: Any, **kwargs: Any) -> AudioMetaData:
     if sf is None:
         raise RuntimeError("soundfile is required for audio metadata fallback")
     info = sf.info(filepath)
+    bits = 16
+    if hasattr(info, "subtype") and info.subtype:
+        import re
+        m = re.search(r"\d+", str(info.subtype))
+        if m:
+            try:
+                bits = int(m.group(0))
+            except ValueError:
+                bits = 16
     return AudioMetaData(
         sample_rate=info.samplerate,
         num_frames=info.frames,
         num_channels=info.channels,
-        bits_per_sample=getattr(info, "subtype_info", {}).get("bits", 16) or 16,
+        bits_per_sample=bits,
         encoding=getattr(info, "subtype", "PCM_S") or "PCM_S",
     )
 
